@@ -9,6 +9,7 @@ import type { GitlogueLink, GitloguePlace, GitlogueSaved } from '../types'
 
 import { candidatePaths, downloadTargets, reverseApply, type EngineHunk } from './bashfiles'
 import { chainTo, parentOf, type DirEntry } from './explorer'
+import { registerChat } from './chat'
 import { imageBox, layoutFor, paint, type Layout } from './frame'
 import { Player, type PlayerEvent } from './player'
 import { DEFAULT_THEME, THEMES } from './themes'
@@ -57,6 +58,7 @@ export const register: Register = (on, options) => {
   const speedMs = 30 / rate
   const maxLagMs = (Math.max(1, Number(options.maxLag) || 20) * 1000) / rate
   const openAtStart = options.open !== 'command'
+  const chatOption = options.chat !== 'off'
 
   const player = new Player(speedMs, maxLagMs)
   let cwd = ''
@@ -64,6 +66,9 @@ export const register: Register = (on, options) => {
   let mounted: Layout | undefined
   let shownTurn = -1
   let shownScene = -1
+  // The conversation reads as a phone chat while the pane is drawn.
+  const isChatOn = () => chatOption && mounted !== undefined
+  let chatShown = false
   let lastTick = Date.now()
   let sent = { tree: '', main: '' }
   let isBlitting = false
@@ -176,6 +181,10 @@ export const register: Register = (on, options) => {
       }
       player.advance(dt)
       persist()
+      if (isChatOn() !== chatShown) {
+        chatShown = isChatOn()
+        $.ui.invalidate('ui.render')
+      }
       if (player.turnVersion !== shownTurn || player.sceneVersion !== shownScene) {
         // The turn info is drawn as text and a picture as an image; a redraw
         // remounts the rasters too.
@@ -235,8 +244,12 @@ export const register: Register = (on, options) => {
   on('ui.render', { component: 'TurnDuration' }, ($, e, next) => {
     words.set(e.props.durationMs, e.props.word)
     if (words.size > 50) words.delete(words.keys().next().value as number)
-    return next(e)
+    if (!isChatOn() || e.surface !== 'terminal') return next(e)
+    const { Box } = $.ui.resolve(e)
+    return <Box display="none" />
   })
+
+  registerChat(on, { isOn: isChatOn, theme, hex })
 
   // /resume inside a running session switches to another one's replay.
   on('classic.SessionStart', async ($, e, next) => {
@@ -253,6 +266,8 @@ export const register: Register = (on, options) => {
 
   on('ui.close', { id: PANE }, ($, e, next) => {
     mounted = undefined
+    chatShown = false
+    $.ui.invalidate('ui.render')
     schedule()
     return next(e)
   })

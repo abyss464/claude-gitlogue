@@ -58,6 +58,16 @@
         "auto",
         "command"
       ]
+    },
+    "chat": {
+      "type": "string",
+      "title": "Chat view",
+      "description": "on: while the pane is open, the conversation reads as a LINE-style phone chat (your messages in green on the right, Claude's under its mascot on the left, tool rows left to the pane) and Claude writes its replies like chat messages; off: the conversation stays as it is.",
+      "default": "on",
+      "options": [
+        "on",
+        "off"
+      ]
     }
   },
   "types": "./types/index.d.ts"
