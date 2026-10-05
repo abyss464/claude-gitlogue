@@ -13,7 +13,8 @@ const INK_ON_MINE = '#0a0a0a'
 // Claude Code's mascot, as its welcome banner draws it.
 const MASCOT = [' ▐▛███▜▌ ', '▝▜█████▛▘', '  ▘▘ ▝▝  ']
 const AVATAR_WIDTH = 10
-const PHONE_WIDTH = 64
+const PHONE_WIDTH = 76
+const THEIRS = 0x3a3d47
 
 export const CHAT_TONE = [
   'The person is reading this conversation as a LINE-style chat on a phone screen,',
@@ -61,40 +62,53 @@ export function registerChat(on: On, ctx: { isOn: () => boolean; theme: Theme; h
     }
     return stamp
   }
-  // The phone's column within the transcript: centred, at most a phone wide.
+  // The phone's screen within the transcript: centred, at most a phone wide.
   const column = (columns: number | undefined) => {
-    const width = Math.max(30, (columns ?? 80) - 2)
+    const width = Math.max(40, (columns ?? 80) - 2)
     const phone = Math.min(width, PHONE_WIDTH)
     return { phone, margin: Math.floor((width - phone) / 2) }
   }
+  const screen = () => ctx.hex(ctx.theme.backgroundLeft)
 
   on('ui.render', { component: 'UserMessage' }, ($, e, next) => {
     if (!ctx.isOn() || e.props.isExpanded || e.surface !== 'terminal') return next(e)
     const { Box, Text } = $.ui.resolve(e)
     const { phone, margin } = column(e.viewport?.columns)
     const text = e.props.text.trim()
+    const bg = screen()
     // Messages from the system, a task or another agent sit centred, as notices do.
     if (e.props.task || e.props.from) {
-      const line = text.split('\n')[0] ?? ''
       return (
-        <Box paddingLeft={margin} width={margin + phone} justifyContent="center">
-          <Text dimColor wrap="truncate-end">
-            {line}
-          </Text>
+        <Box flexDirection="row">
+          <Box width={margin} />
+          <Box width={phone} backgroundColor={bg} justifyContent="center" paddingY={1}>
+            <Text dimColor wrap="truncate-end">
+              {text.split('\n')[0] ?? ''}
+            </Text>
+          </Box>
         </Box>
       )
     }
     const width = bubbleWidth(text, Math.floor(phone * 0.72), false)
     return (
-      <Box paddingLeft={margin} width={margin + phone} flexDirection="row" justifyContent="flex-end" alignItems="flex-end">
-        <Box flexDirection="column" alignItems="flex-end" marginRight={1}>
-          <Text dimColor>已读</Text>
-          <Text dimColor>{stampOf(e.requestId)}</Text>
-        </Box>
-        <Box width={width} paddingX={1} backgroundColor={MINE}>
-          <Text color={INK_ON_MINE} backgroundColor={MINE}>
-            {text}
-          </Text>
+      <Box flexDirection="row">
+        <Box width={margin} />
+        <Box width={phone} backgroundColor={bg} flexDirection="row" justifyContent="flex-end" alignItems="flex-end" paddingTop={1} paddingRight={1}>
+          <Box flexDirection="column" alignItems="flex-end" marginRight={1}>
+            <Text dimColor>已读</Text>
+            <Text dimColor>{stampOf(e.requestId)}</Text>
+          </Box>
+          <Box flexDirection="column" width={width}>
+            <Text color={MINE}>{'▗' + '▄'.repeat(width - 2) + '▖'}</Text>
+            <Box width={width} paddingX={1} backgroundColor={MINE}>
+              <Text color={INK_ON_MINE}>{text}</Text>
+            </Box>
+            <Text color={MINE}>{'▝' + '▀'.repeat(width - 2) + '▘'}</Text>
+          </Box>
+          <Box flexDirection="column" width={1}>
+            <Text> </Text>
+            <Text color={MINE}>◥</Text>
+          </Box>
         </Box>
       </Box>
     )
@@ -104,29 +118,40 @@ export function registerChat(on: On, ctx: { isOn: () => boolean; theme: Theme; h
     if (!ctx.isOn() || e.surface !== 'terminal') return next(e)
     const { Box, Text, Markdown } = $.ui.resolve(e)
     const { phone, margin } = column(e.viewport?.columns)
-    const bubble = ctx.hex(ctx.theme.editorCursorLineBg)
-    const width = bubbleWidth(e.props.text, Math.floor(phone * 0.78) - AVATAR_WIDTH, true)
+    const bg = screen()
+    const fill = ctx.hex(THEIRS)
+    const width = Math.max(4, bubbleWidth(e.props.text, Math.floor(phone * 0.8) - AVATAR_WIDTH - 1, true))
     const first = e.props.isFirstOfReply
     return (
-      <Box paddingLeft={margin} width={margin + phone} flexDirection="row">
-        <Box width={AVATAR_WIDTH} flexDirection="column">
-          {first && MASCOT.map(row => <Text color={CLAUDE}>{row}</Text>)}
-        </Box>
-        <Box flexDirection="column">
-          {first && <Text color={ctx.hex(ctx.theme.fileTreeCurrentFileFg)}>Claude</Text>}
-          <Box flexDirection="row" alignItems="flex-end">
-            <Box width={width} paddingX={1} backgroundColor={bubble}>
-              <Markdown text={e.props.text} />
-            </Box>
-            <Box marginLeft={1}>
-              <Text dimColor>{stampOf(e.requestId)}</Text>
+      <Box flexDirection="row">
+        <Box width={margin} />
+        <Box width={phone} backgroundColor={bg} flexDirection="row" paddingTop={first ? 1 : 0} paddingLeft={1}>
+          <Box width={AVATAR_WIDTH} flexDirection="column">
+            {first && MASCOT.map(row => <Text color={CLAUDE}>{row}</Text>)}
+          </Box>
+          <Box flexDirection="column">
+            {first && <Text dimColor>Claude</Text>}
+            <Box flexDirection="row" alignItems="flex-end">
+              <Box flexDirection="column" width={1}>
+                <Text> </Text>
+                <Text color={fill}>{first ? '◤' : ' '}</Text>
+              </Box>
+              <Box flexDirection="column" width={width}>
+                <Text color={fill}>{'▗' + '▄'.repeat(width - 2) + '▖'}</Text>
+                <Box width={width} paddingX={1} backgroundColor={fill}>
+                  <Markdown text={e.props.text} />
+                </Box>
+                <Text color={fill}>{'▝' + '▀'.repeat(width - 2) + '▘'}</Text>
+              </Box>
+              <Box marginLeft={1}>
+                <Text dimColor>{stampOf(e.requestId)}</Text>
+              </Box>
             </Box>
           </Box>
         </Box>
       </Box>
     )
   })
-
   on('ui.render', { component: 'Spinner' }, ($, e, next) => {
     if (!ctx.isOn() || e.surface !== 'terminal') return next(e)
     const { Box, Text } = $.ui.resolve(e)
