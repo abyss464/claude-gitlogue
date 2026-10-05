@@ -28,6 +28,14 @@ const GIT_ADD_CMD_PAUSE = 16.7
 const PUSH_OUTPUT_PAUSE = 10.0
 
 const MAX_TERMINAL_LINES = 300
+// Past these a change is a machine's output, not something typed: it is
+// counted in the tree and noted in the terminal, never replayed key by key.
+const MAX_TYPED_LINE = 1000
+const MAX_TYPED_CHARS = 100_000
+const LOCK_FILES = new Set([
+  'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'bun.lockb', 'Cargo.lock', 'poetry.lock', 'uv.lock',
+  'Pipfile.lock', 'Gemfile.lock', 'composer.lock', 'go.sum', 'flake.lock', 'mix.lock', 'pubspec.lock',
+])
 const TAB_WIDTH = 4
 
 export type TurnInfo = GitlogueTurn
@@ -370,6 +378,17 @@ export class Player {
     const hunks = diffLines(oldLines, newLines)
     if (hunks.length === 0) return
     const { added, deleted } = countChanges(hunks)
+    const skipped = untypeable(event.path, hunks)
+    if (skipped) {
+      this.pause(CHECKOUT_PAUSE)
+      this.push({ k: 'count', entry: { path: event.path, status: event.created ? '+' : '~', added, deleted } })
+      this.push({
+        k: 'termLine',
+        line: { kind: 'edit', text: `${cellText(event.path)} · ${skipped}, not replayed`, right: `+${added} −${deleted}`, ok: true },
+      })
+      this.pause(GIT_ADD_CMD_PAUSE)
+      return
+    }
     const change: FileChange = {
       path: event.path,
       oldLines,
@@ -581,6 +600,18 @@ export class Player {
     }
     if (this.terminal.length > MAX_TERMINAL_LINES) this.terminal.splice(0, this.terminal.length - MAX_TERMINAL_LINES)
   }
+}
+
+// Why a change is not typed out, or undefined when it is.
+function untypeable(path: string, hunks: Hunk[]): string | undefined {
+  if (LOCK_FILES.has(path.slice(path.lastIndexOf('/') + 1))) return 'lock file'
+  let typed = 0
+  for (const hunk of hunks)
+    for (const line of hunk.lines) {
+      if (line.text.length > MAX_TYPED_LINE) return 'generated'
+      if (line.kind === 'add') typed += line.text.length
+    }
+  return typed > MAX_TYPED_CHARS ? 'too large' : undefined
 }
 
 function formatDuration(ms: number, precise = false): string {

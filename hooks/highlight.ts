@@ -344,6 +344,7 @@ export function languageFor(path: string): Lang {
 
 export type LineTokens = { toks: Uint8Array; end: string }
 
+const LONG_LINE = 2000
 const IDENT_START = /[A-Za-z_]/
 const IDENT = /[A-Za-z0-9_]/
 const DIGIT = /[0-9]/
@@ -619,6 +620,13 @@ export class Highlighter {
   }
 
   private run(text: string, start: string): LineTokens {
+    // A very long line colors its head only, and is never kept.
+    if (text.length > LONG_LINE) {
+      const head = tokenize(this.lang, text.slice(0, LONG_LINE), start)
+      const toks = new Uint8Array(text.length)
+      toks.set(head.toks)
+      return { toks, end: head.end }
+    }
     const key = start + '\u0000' + text
     let hit = this.cache.get(key)
     if (!hit) {
