@@ -1,0 +1,54 @@
+{
+  "name": "gitlogue",
+  "version": "0.1.0",
+  "description": "Replays Claude's edits as gitlogue-style live typing in a pane: file tree, editor, turn info and terminal.",
+  "userConfig": {
+    "theme": {
+      "type": "string",
+      "title": "Theme",
+      "description": "Color scheme, one of gitlogue's built-in themes.",
+      "default": "tokyo-night",
+      "options": [
+        "ayu-dark",
+        "catppuccin",
+        "dracula",
+        "everforest",
+        "fluorite",
+        "github-dark",
+        "gruvbox",
+        "material",
+        "monokai",
+        "night-owl",
+        "nord",
+        "one-dark",
+        "rose-pine",
+        "solarized-dark",
+        "solarized-light",
+        "telemetry",
+        "tokyo-night"
+      ]
+    },
+    "speed": {
+      "type": "number",
+      "title": "Typing speed",
+      "description": "Milliseconds per typed character, as gitlogue's --speed.",
+      "default": 30
+    },
+    "maxLag": {
+      "type": "number",
+      "title": "Max lag",
+      "description": "Seconds the replay may fall behind Claude; past it, playback speeds up to catch up.",
+      "default": 20
+    },
+    "open": {
+      "type": "string",
+      "title": "Open the pane",
+      "description": "auto opens it when a session starts (in a terminal 144 columns or wider; narrower, /gitlogue opens it); command opens it only with /gitlogue.",
+      "default": "auto",
+      "options": [
+        "auto",
+        "command"
+      ]
+    }
+  }
+}

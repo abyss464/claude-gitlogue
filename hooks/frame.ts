@@ -1,0 +1,342 @@
+// Paints the player's state as gitlogue lays it out: file tree over turn info
+// on the left (30%), editor over terminal on the right (70%), an Open File
+// dialog over the middle. Cells are packed as Raster cells: [codePoint, fg, bg].
+
+import { Tok } from './highlight'
+import type { FileEntry, Player } from './player'
+import type { Theme } from './themes'
+
+export const DEFAULT_COLOR = 0x01000000
+
+export type Layout = {
+  width: number
+  height: number
+  leftWidth: number
+  rightWidth: number
+  // Rows of the upper panes (tree, editor); the separator follows when there is a lower one.
+  topRows: number
+  bottomRows: number
+}
+
+export function layoutFor(width: number, height: number): Layout {
+  const leftWidth = width >= 72 ? Math.floor(width * 0.3) : 0
+  const hasBottom = height >= 12
+  const topRows = hasBottom ? Math.round((height - 1) * 0.8) : height
+  return {
+    width,
+    height,
+    leftWidth,
+    rightWidth: width - leftWidth,
+    topRows,
+    bottomRows: hasBottom ? height - topRows - 1 : 0,
+  }
+}
+
+export class Canvas {
+  readonly width: number
+  readonly height: number
+  readonly cells: Uint32Array
+
+  constructor(width: number, height: number) {
+    this.width = width
+    this.height = height
+    this.cells = new Uint32Array(width * height * 3)
+    for (let i = 0; i < this.cells.length; i += 3) {
+      this.cells[i] = 0x20
+      this.cells[i + 1] = DEFAULT_COLOR
+      this.cells[i + 2] = DEFAULT_COLOR
+    }
+  }
+
+  set(x: number, y: number, ch: string, fg: number, bg: number) {
+    if (x < 0 || y < 0 || x >= this.width || y >= this.height) return
+    const i = (y * this.width + x) * 3
+    this.cells[i] = ch.charCodeAt(0)
+    this.cells[i + 1] = fg
+    this.cells[i + 2] = bg
+  }
+
+  fill(x: number, y: number, w: number, h: number, bg: number) {
+    for (let row = y; row < y + h; row++) for (let col = x; col < x + w; col++) this.set(col, row, ' ', bg, bg)
+  }
+
+  background(x: number, y: number, w: number, bg: number) {
+    if (y < 0 || y >= this.height) return
+    for (let col = Math.max(0, x); col < Math.min(this.width, x + w); col++) this.cells[(y * this.width + col) * 3 + 2] = bg
+  }
+
+  // Writes text from (x, y), cut at `maxX`; returns where it stopped.
+  text(x: number, y: number, s: string, fg: number, bg: number, maxX = this.width): number {
+    for (let i = 0; i < s.length && x < maxX; i++) this.set(x++, y, s[i], fg, bg)
+    return x
+  }
+
+  // The cells of one rectangle, base64 as a Raster takes them.
+  encode(x: number, y: number, w: number, h: number): string {
+    const out = new Uint32Array(w * h * 3)
+    for (let row = 0; row < h; row++) {
+      const from = ((y + row) * this.width + x) * 3
+      out.set(this.cells.subarray(from, from + w * 3), row * w * 3)
+    }
+    return toBase64(new Uint8Array(out.buffer))
+  }
+}
+
+const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+
+function toBase64(bytes: Uint8Array): string {
+  const parts: string[] = []
+  let chunk = ''
+  let i = 0
+  for (; i + 2 < bytes.length; i += 3) {
+    const n = (bytes[i] << 16) | (bytes[i + 1] << 8) | bytes[i + 2]
+    chunk += B64[(n >> 18) & 63] + B64[(n >> 12) & 63] + B64[(n >> 6) & 63] + B64[n & 63]
+    if (chunk.length >= 8192) {
+      parts.push(chunk)
+      chunk = ''
+    }
+  }
+  const rest = bytes.length - i
+  if (rest === 1) {
+    const n = bytes[i] << 16
+    chunk += B64[(n >> 18) & 63] + B64[(n >> 12) & 63] + '=='
+  } else if (rest === 2) {
+    const n = (bytes[i] << 16) | (bytes[i + 1] << 8)
+    chunk += B64[(n >> 18) & 63] + B64[(n >> 12) & 63] + B64[(n >> 6) & 63] + '='
+  }
+  parts.push(chunk)
+  return parts.join('')
+}
+
+// Fades a color toward the background, as gitlogue dims rows away from the cursor.
+function fade(fg: number, bg: number, distance: number): number {
+  if (distance <= 0 || fg === DEFAULT_COLOR || bg === DEFAULT_COLOR) return fg
+  const opacity = 1 - (Math.min(distance, 20) / 20) * 0.4
+  const mix = (shift: number) =>
+    Math.round(((fg >> shift) & 255) * opacity + ((bg >> shift) & 255) * (1 - opacity)) << shift
+  return mix(16) | mix(8) | mix(0)
+}
+
+function tokenColor(theme: Theme, tok: number): number {
+  switch (tok) {
+    case Tok.Keyword:
+      return theme.syntaxKeyword
+    case Tok.Type:
+      return theme.syntaxType
+    case Tok.Function:
+      return theme.syntaxFunction
+    case Tok.String:
+      return theme.syntaxString
+    case Tok.Number:
+      return theme.syntaxNumber
+    case Tok.Comment:
+      return theme.syntaxComment
+    case Tok.Operator:
+      return theme.syntaxOperator
+    case Tok.Punctuation:
+      return theme.syntaxPunctuation
+    case Tok.Constant:
+      return theme.syntaxConstant
+    case Tok.Parameter:
+      return theme.syntaxParameter
+    case Tok.Property:
+      return theme.syntaxProperty
+    case Tok.Label:
+      return theme.syntaxLabel
+    default:
+      return theme.syntaxVariable
+  }
+}
+
+type Box = { x: number; y: number; w: number; h: number }
+
+// The inside of a pane after gitlogue's padding: one row top and bottom, two columns each side.
+function inner(box: Box): Box {
+  const padY = box.h >= 3 ? 1 : 0
+  const padX = box.w >= 12 ? 2 : 0
+  return { x: box.x + padX, y: box.y + padY, w: box.w - 2 * padX, h: box.h - 2 * padY }
+}
+
+export function paint(player: Player, theme: Theme, layout: Layout, cursorOn: boolean): Canvas {
+  const canvas = new Canvas(layout.width, layout.height)
+  const { leftWidth, rightWidth, topRows, bottomRows } = layout
+  if (leftWidth > 0) {
+    paintTree(canvas, player, theme, { x: 0, y: 0, w: leftWidth, h: topRows })
+    if (bottomRows > 0) {
+      canvas.text(0, topRows, '─'.repeat(leftWidth), theme.separator, theme.backgroundLeft)
+      canvas.fill(0, topRows + 1, leftWidth, bottomRows, theme.backgroundLeft)
+    }
+  }
+  paintEditor(canvas, player, theme, { x: leftWidth, y: 0, w: rightWidth, h: topRows }, cursorOn)
+  if (bottomRows > 0) {
+    canvas.text(leftWidth, topRows, '─'.repeat(rightWidth), theme.separator, theme.backgroundRight)
+    paintTerminal(canvas, player, theme, { x: leftWidth, y: topRows + 1, w: rightWidth, h: bottomRows }, cursorOn)
+  }
+  if (player.dialog) paintDialog(canvas, player.dialog, theme)
+  return canvas
+}
+
+function paintEditor(canvas: Canvas, player: Player, theme: Theme, box: Box, cursorOn: boolean) {
+  const bg = theme.backgroundRight
+  canvas.fill(box.x, box.y, box.w, box.h, bg)
+  const area = inner(box)
+  if (area.w <= 0 || area.h <= 0) return
+
+  if (!player.hasFile) {
+    const message = player.turn ? 'Waiting for Claude to edit...' : 'Waiting for Claude...'
+    const x = area.x + Math.max(0, Math.floor((area.w - message.length) / 2))
+    canvas.text(x, area.y + Math.floor(area.h / 2), message, theme.statusNoCommit, bg, area.x + area.w)
+    return
+  }
+
+  const lines = player.lines
+  const numberWidth = Math.max(3, String(lines.length).length)
+  const gutter = numberWidth + 1 + 2
+  const textWidth = Math.max(1, area.w - gutter)
+  const rowsOf = (line: string) => Math.max(1, Math.ceil(line.length / textWidth))
+
+  // Keep the cursor's row in the middle, as gitlogue scrolls.
+  let cursorRow = 0
+  let total = 0
+  for (let i = 0; i < lines.length; i++) {
+    if (i === player.cursorLine) cursorRow = total + Math.min(rowsOf(lines[i]) - 1, Math.floor(player.cursorCol / textWidth))
+    total += rowsOf(lines[i])
+  }
+  const half = Math.floor(area.h / 2)
+  const top =
+    cursorRow < half ? 0 : cursorRow + half >= total ? Math.max(0, total - area.h) : cursorRow - half
+
+  let index = 0
+  let skipped = 0
+  while (index < lines.length && skipped + rowsOf(lines[index]) <= top) skipped += rowsOf(lines[index++])
+  let sub = top - skipped
+
+  const showCursor = cursorOn && player.active === 'editor'
+  for (let row = 0; row < area.h && index < lines.length; row++) {
+    const y = area.y + row
+    const line = lines[index]
+    const isCursorLine = index === player.cursorLine
+    const rowBg = isCursorLine ? theme.editorCursorLineBg : bg
+    const distance = Math.abs(index - player.cursorLine)
+    if (isCursorLine) canvas.background(box.x, y, box.w, rowBg)
+
+    if (sub === 0) {
+      const number = String(index + 1).padStart(numberWidth) + ' '
+      const color = isCursorLine ? theme.editorLineNumberCursor : fade(theme.editorLineNumber, rowBg, distance)
+      canvas.text(area.x, y, number, color, rowBg)
+    }
+
+    const toks = player.highlighter.line(lines, index)
+    const from = sub * textWidth
+    const to = Math.min(line.length, from + textWidth)
+    const x0 = area.x + gutter
+    for (let col = from; col < to; col++)
+      canvas.set(x0 + col - from, y, line[col], fade(tokenColor(theme, toks[col]), rowBg, distance), rowBg)
+
+    if (isCursorLine && showCursor) {
+      const isLastRow = sub === rowsOf(line) - 1
+      const col = player.cursorCol
+      if ((col >= from && col < from + textWidth) || (isLastRow && col >= from)) {
+        const x = x0 + Math.min(col - from, textWidth - 1)
+        canvas.set(x, y, line[col] ?? ' ', theme.editorCursorCharFg, theme.editorCursorCharBg)
+      }
+    }
+
+    if (++sub >= rowsOf(line)) {
+      sub = 0
+      index++
+    }
+  }
+}
+
+type TreeRow = { dir: string } | { entry: FileEntry; name: string; indent: boolean }
+
+function treeRows(files: Map<string, FileEntry>): TreeRow[] {
+  const byDir = new Map<string, FileEntry[]>()
+  for (const entry of files.values()) {
+    const cut = entry.path.lastIndexOf('/')
+    const dir = cut < 0 ? '' : entry.path.slice(0, cut)
+    byDir.set(dir, [...(byDir.get(dir) ?? []), entry])
+  }
+  const rows: TreeRow[] = []
+  for (const dir of [...byDir.keys()].sort()) {
+    if (dir) rows.push({ dir })
+    const entries = byDir.get(dir)!.map(entry => ({ entry, name: entry.path.slice(dir ? dir.length + 1 : 0) }))
+    entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+    for (const { entry, name } of entries) rows.push({ entry, name, indent: dir !== '' })
+  }
+  return rows
+}
+
+function paintTree(canvas: Canvas, player: Player, theme: Theme, box: Box) {
+  const bg = theme.backgroundLeft
+  canvas.fill(box.x, box.y, box.w, box.h, bg)
+  const area = inner(box)
+  if (area.w <= 0 || area.h <= 0) return
+  const rows = treeRows(player.files)
+  const selected = rows.findIndex(row => 'entry' in row && row.entry.path === player.currentPath)
+  const offset =
+    selected >= area.h ? Math.min(selected - Math.floor(area.h / 2), rows.length - area.h) : 0
+  const maxX = area.x + area.w
+
+  for (let r = 0; r < area.h && offset + r < rows.length; r++) {
+    const index = offset + r
+    const row = rows[index]
+    const y = area.y + r
+    const isSelected = index === selected
+    const rowBg = isSelected ? theme.fileTreeCurrentFileBg : bg
+    const distance = selected < 0 ? 0 : Math.abs(index - selected)
+    const dim = (color: number) => fade(color, rowBg, distance)
+    if (isSelected) canvas.background(area.x, y, area.w, rowBg)
+    if ('dir' in row) {
+      canvas.text(area.x, y, row.dir + '/', dim(theme.fileTreeDirectory), rowBg, maxX)
+      continue
+    }
+    const { entry } = row
+    const statusColor = entry.status === '+' ? theme.fileTreeAdded : theme.fileTreeModified
+    let x = area.x + (row.indent ? 2 : 0)
+    x = canvas.text(x, y, entry.status + ' ', dim(statusColor), rowBg, maxX)
+    const nameColor = isSelected ? theme.fileTreeCurrentFileFg : theme.fileTreeDefault
+    x = canvas.text(x, y, row.name, dim(nameColor), rowBg, maxX)
+    x = canvas.text(x, y, ` +${entry.added}`, dim(theme.fileTreeStatsAdded), rowBg, maxX)
+    canvas.text(x, y, ` -${entry.deleted}`, dim(theme.fileTreeStatsDeleted), rowBg, maxX)
+  }
+}
+
+function paintTerminal(canvas: Canvas, player: Player, theme: Theme, box: Box, cursorOn: boolean) {
+  const bg = theme.backgroundRight
+  canvas.fill(box.x, box.y, box.w, box.h, bg)
+  const area = inner(box)
+  if (area.w <= 0 || area.h <= 0) return
+  const lines = player.terminal
+  const start = Math.max(0, lines.length - area.h)
+  const maxX = area.x + area.w
+  for (let i = start; i < lines.length; i++) {
+    const y = area.y + i - start
+    const line = lines[i]
+    const isCommand = line.startsWith('~ ')
+    let shown = line
+    if (line.length > area.w) shown = isCommand ? line.slice(0, 2) + '…' + line.slice(line.length - area.w + 4) : line.slice(0, area.w - 1) + '…'
+    const end = canvas.text(area.x, y, shown, isCommand ? theme.terminalCommand : theme.terminalOutput, bg, maxX)
+    if (i === lines.length - 1 && isCommand && cursorOn && player.active === 'terminal')
+      canvas.set(Math.min(end, maxX - 1), y, ' ', theme.terminalCursorFg, theme.terminalCursorBg)
+  }
+}
+
+function paintDialog(canvas: Canvas, dialog: { title: string; text: string }, theme: Theme) {
+  const width = Math.min(canvas.width, Math.max(60, dialog.text.length + 10))
+  if (width < 8 || canvas.height < 3) return
+  const x = Math.floor((canvas.width - width) / 2)
+  const y = Math.floor((canvas.height - 3) / 2)
+  const fg = theme.fileTreeCurrentFileFg
+  const bg = theme.editorCursorLineBg
+  canvas.fill(x, y, width, 3, bg)
+  canvas.text(x, y, '┌' + '─'.repeat(width - 2) + '┐', fg, bg)
+  canvas.text(x + 1, y, dialog.title.slice(0, width - 2), fg, bg)
+  canvas.set(x, y + 1, '│', fg, bg)
+  canvas.set(x + width - 1, y + 1, '│', fg, bg)
+  canvas.text(x, y + 2, '└' + '─'.repeat(width - 2) + '┘', fg, bg)
+  const room = width - 4
+  const shown = dialog.text.length > room ? '…' + dialog.text.slice(dialog.text.length - room + 1) : dialog.text
+  canvas.text(x + 2, y + 1, shown, fg, bg)
+}
