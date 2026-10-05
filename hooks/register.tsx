@@ -43,8 +43,11 @@ function stamp(ms: number): string {
 
 export const register: Register = (on, options) => {
   const theme = THEMES[String(options.theme)] ?? THEMES[DEFAULT_THEME]
-  const speedMs = Math.max(1, Number(options.speed) || 30)
-  const maxLagMs = Math.max(1, Number(options.maxLag) || 20) * 1000
+  // gitlogue types at 30 ms a character; the playback option scales all of it,
+  // and how far the replay may fall behind scales with it.
+  const rate = Math.min(10, Math.max(0.1, parseFloat(String(options.playback)) || 1))
+  const speedMs = 30 / rate
+  const maxLagMs = (Math.max(1, Number(options.maxLag) || 20) * 1000) / rate
   const openAtStart = options.open !== 'command'
 
   const player = new Player(speedMs, maxLagMs)

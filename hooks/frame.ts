@@ -274,6 +274,14 @@ function paintTree(canvas: Canvas, player: Player, theme: Theme, box: Box) {
   const area = inner(box)
   if (area.w <= 0 || area.h <= 0) return
   const rows = treeRows(player.files)
+  // Files the current turn has not touched recede.
+  const turn = player.turn?.id
+  const isOld = (entry: FileEntry) => turn !== undefined && entry.turn !== turn
+  const oldDirs = new Set(
+    [...new Set([...player.files.values()].map(entry => entry.path.slice(0, Math.max(0, entry.path.lastIndexOf('/')))))].filter(
+      dir => [...player.files.values()].every(entry => !entry.path.startsWith(dir + '/') || isOld(entry)),
+    ),
+  )
   const selected = rows.findIndex(row => 'entry' in row && row.entry.path === player.currentPath)
   const offset =
     selected >= area.h ? Math.min(selected - Math.floor(area.h / 2), rows.length - area.h) : 0
@@ -285,7 +293,8 @@ function paintTree(canvas: Canvas, player: Player, theme: Theme, box: Box) {
     const y = area.y + r
     const isSelected = index === selected
     const rowBg = isSelected ? theme.fileTreeCurrentFileBg : bg
-    const distance = selected < 0 ? 0 : Math.abs(index - selected)
+    const isPast = 'dir' in row ? oldDirs.has(row.dir) : isOld(row.entry)
+    const distance = Math.max(selected < 0 ? 0 : Math.abs(index - selected), isPast ? 14 : 0)
     const dim = (color: number) => fade(color, rowBg, distance)
     if (isSelected) canvas.background(area.x, y, area.w, rowBg)
     if ('dir' in row) {

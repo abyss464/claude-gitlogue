@@ -28,16 +28,25 @@
         "tokyo-night"
       ]
     },
-    "speed": {
-      "type": "number",
-      "title": "Typing speed",
-      "description": "Milliseconds per typed character, as gitlogue's --speed.",
-      "default": 30
+    "playback": {
+      "type": "string",
+      "title": "Playback speed",
+      "description": "How fast the replay plays, as a multiple of gitlogue's typing speed (30 ms a character). The time the replay may fall behind scales with it.",
+      "default": "1x",
+      "options": [
+        "0.1x",
+        "0.2x",
+        "0.5x",
+        "1x",
+        "2x",
+        "5x",
+        "10x"
+      ]
     },
     "maxLag": {
       "type": "number",
       "title": "Max lag",
-      "description": "Seconds the replay may fall behind Claude; past it, playback speeds up to catch up.",
+      "description": "Seconds the replay may fall behind Claude at 1x (scaled by the playback speed); past it, playback speeds up to catch up.",
       "default": 20
     },
     "open": {

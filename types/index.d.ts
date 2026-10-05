@@ -3,7 +3,8 @@
 
 export type GitlogueTurn = { id: string; date: string; prompt: string }
 
-export type GitlogueFileEntry = { path: string; status: '+' | '~'; added: number; deleted: number }
+// `turn` is the id of the turn that last changed the file.
+export type GitlogueFileEntry = { path: string; status: '+' | '~'; added: number; deleted: number; turn?: string }
 
 export type GitlogueEvent =
   | { type: 'turn'; turn: GitlogueTurn }

@@ -365,8 +365,6 @@ export class Player {
 
   private scriptTurn(turn: TurnInfo) {
     this.filesThisTurn = 0
-    this.scriptedPath = undefined
-    this.scriptedText = undefined
     this.push({ k: 'termLine', line: { kind: 'rule', text: `${turn.id} · ${turn.date.slice(-8)}` } })
     this.pause(CHECKOUT_OUTPUT_PAUSE)
     this.push({ k: 'resetTurn', turn })
@@ -537,11 +535,12 @@ export class Player {
       }
       case 'count': {
         const known = this.files.get(step.entry.path)
+        const turn = this.turn?.id
         this.files.set(
           step.entry.path,
           known
-            ? { ...known, added: known.added + step.entry.added, deleted: known.deleted + step.entry.deleted }
-            : { ...step.entry },
+            ? { ...known, added: known.added + step.entry.added, deleted: known.deleted + step.entry.deleted, turn }
+            : { ...step.entry, turn },
         )
         this.currentPath = step.entry.path
         break
@@ -586,15 +585,11 @@ export class Player {
         this.addLine({ kind: 'prompt', text: '' })
         break
       }
+      // A new turn keeps the session's files and the open one; only what the
+      // turn is about changes.
       case 'resetTurn':
         this.turn = step.turn
         this.turnVersion++
-        this.files.clear()
-        this.currentPath = undefined
-        this.hasFile = false
-        this.lines = ['']
-        this.cursorLine = 0
-        this.cursorCol = 0
         this.active = 'terminal'
         break
     }
