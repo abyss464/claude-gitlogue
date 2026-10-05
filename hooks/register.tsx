@@ -9,7 +9,7 @@ import type { GitlogueLink, GitloguePlace, GitlogueSaved } from '../types'
 
 import { candidatePaths, downloadTargets, reverseApply, type EngineHunk } from './bashfiles'
 import { chainTo, parentOf, type DirEntry } from './explorer'
-import { registerChat } from './chat'
+import { Chat, drawPhone, registerChat } from './chat'
 import { imageBox, layoutFor, paint, type Layout } from './frame'
 import { Player, type PlayerEvent } from './player'
 import { DEFAULT_THEME, THEMES } from './themes'
@@ -20,6 +20,9 @@ const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit'])
 const FAST_TICK_MS = 33
 const BLINK_MS = 500
 const MAX_SNAPSHOT_BYTES = 1_000_000
+// With the chat in it, the pane asks to take nearly the whole width: the
+// transcript beside it has nothing left to show.
+const WIDE_DOCK = 400
 // The replays kept for /resume: the newest few sessions, each within a share of
 // the 4 MiB store.
 const KEPT_SESSIONS = 3
@@ -70,6 +73,7 @@ export const register: Register = (on, options) => {
   const isChatOn = () => chatOption && mounted !== undefined
   let chatShown = false
   let shownCounts = -1
+  let shownChat = -1
   let lastTick = Date.now()
   let sent = { tree: '', main: '' }
   let isBlitting = false
@@ -104,6 +108,7 @@ export const register: Register = (on, options) => {
 
   on('session.start', async ($, e, next) => {
     cwd = e.cwd
+    chat.load(await $.session.messages().catch(() => []))
     lastTick = Date.now()
 
     let session = await $.session.id()
@@ -185,9 +190,10 @@ export const register: Register = (on, options) => {
       // The chat coming or going, or the turn's counts moving under it, redraw
       // the transcript and the turn info.
       const counts = [...player.files.values()].reduce((n, f) => n + f.added * 7 + f.deleted * 13 + 1, 0)
-      if (isChatOn() !== chatShown || (isChatOn() && counts !== shownCounts)) {
+      if (isChatOn() !== chatShown || (isChatOn() && (counts !== shownCounts || chat.version !== shownChat))) {
         chatShown = isChatOn()
         shownCounts = counts
+        shownChat = chat.version
         $.ui.invalidate('ui.render')
       }
       if (player.turnVersion !== shownTurn || player.sceneVersion !== shownScene) {
@@ -222,11 +228,9 @@ export const register: Register = (on, options) => {
       if (wanted > 0) timer = $.clock.every(wanted, tick)
     }
 
-    // Loaded from a session's mods folder, the mod is being worked on: a tool
-    // that redraws it with its latest code, since calling a plugin's own tool
-    // reloads it first.
-    if ($.plugin.root.includes('/dev-mods/'))
-      await $.tool.register({
+    // A tool that redraws the mod with its latest code, since calling a
+    // plugin's own tool reloads it first: for checking a change to the mod.
+    await $.tool.register({
         name: 'refresh',
         description:
           "Reload the gitlogue mod with its latest saved code and redraw its pane and chat view, to check a change to the mod before the turn ends. Takes no input.",
@@ -236,7 +240,7 @@ export const register: Register = (on, options) => {
       name: 'gitlogue',
       description: "Show or hide the gitlogue pane, which replays Claude's edits as live typing",
     })
-    if (openAtStart && e.isInteractive) void $.ui.open({ id: PANE, title: 'gitlogue', rows: 24 })
+    if (openAtStart && e.isInteractive) void $.ui.open({ id: PANE, title: 'gitlogue', rows: 24, ...(chatOption ? { columns: WIDE_DOCK } : {}) })
     // After a reload the pane may still be up, drawn by the module before this one.
     $.ui.invalidate('ui.render')
     return next(e)
@@ -264,7 +268,8 @@ export const register: Register = (on, options) => {
     return <Box display="none" />
   })
 
-  registerChat(on, { isOn: isChatOn, theme, hex })
+  const chat = new Chat()
+  registerChat(on, { isOn: isChatOn, chat })
 
   // /resume inside a running session switches to another one's replay.
   on('classic.SessionStart', async ($, e, next) => {
@@ -280,7 +285,7 @@ export const register: Register = (on, options) => {
   on('command.run', { command: 'gitlogue' }, async $ => {
     const isOpen = (await $.ui.panes()).some(pane => pane.id === PANE)
     if (isOpen) await $.ui.close({ id: PANE })
-    else await $.ui.open({ id: PANE, title: 'gitlogue', rows: 24 })
+    else await $.ui.open({ id: PANE, title: 'gitlogue', rows: 24, ...(chatOption ? { columns: WIDE_DOCK } : {}) })
     return {}
   })
 
@@ -293,6 +298,7 @@ export const register: Register = (on, options) => {
   })
 
   on('turn.start', ($, e, next) => {
+    chat.working(true)
     const id = e.turnId.replace(/[^0-9a-f]/gi, '').slice(0, 7) || e.turnId.slice(0, 7)
     const prompt = e.text.trim() || '(continued)'
     enqueue({ type: 'turn', turn: { id, date: stamp(Date.now()), prompt: prompt.slice(0, 600) } })
@@ -300,6 +306,7 @@ export const register: Register = (on, options) => {
   })
 
   on('turn.complete', ($, e, next) => {
+    if (e.agentId === undefined) chat.working(false)
     if (e.agentId === undefined) enqueue({ type: 'done', durationMs: e.durationMs, aborted: e.isAborted })
     return next(e)
   })
@@ -499,7 +506,9 @@ export const register: Register = (on, options) => {
       mounted = undefined
       return <Text dimColor>gitlogue needs more room.</Text>
     }
-    const layout = layoutFor(width, height)
+    // The phone takes the pane's left, the replay the rest.
+    const phoneWidth = chatOption ? Math.min(64, Math.max(40, Math.floor(width * 0.34))) : 0
+    const layout = layoutFor(width - (phoneWidth ? phoneWidth + 1 : 0), height)
     mounted = layout
     shownTurn = player.turnVersion
     shownScene = player.sceneVersion
@@ -549,8 +558,11 @@ export const register: Register = (on, options) => {
           </Text>,
         ]
 
+    const { Markdown } = $.ui.resolve(e)
     return (
       <Box flexDirection="row" width={width} height={height}>
+        {phoneWidth > 0 && drawPhone({ Box, Text, Markdown }, chat, theme, hex, phoneWidth, height)}
+        {phoneWidth > 0 && <Box width={1} />}
         {layout.leftWidth > 0 && (
           <Box flexDirection="column" width={layout.leftWidth} height={height}>
             <Raster key="tree" columns={layout.leftWidth} rows={frame.treeRows} cells={frame.tree} />
