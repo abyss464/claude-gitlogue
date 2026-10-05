@@ -204,6 +204,26 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
+  // The words Claude Code closes each turn with (`Cogitated for 1m 57s`), by
+  // the turn's length, so the terminal ends the turn in the same words.
+  const words = new Map<number, string>()
+  player.wordFor = durationMs => {
+    let best: string | undefined
+    let gap = 2000
+    for (const [ms, word] of words) {
+      if (Math.abs(ms - durationMs) < gap) {
+        gap = Math.abs(ms - durationMs)
+        best = word
+      }
+    }
+    return best
+  }
+  on('ui.render', { component: 'TurnDuration' }, ($, e, next) => {
+    words.set(e.props.durationMs, e.props.word)
+    if (words.size > 50) words.delete(words.keys().next().value as number)
+    return next(e)
+  })
+
   // /resume inside a running session switches to another one's replay.
   on('classic.SessionStart', async ($, e, next) => {
     if (e.source === 'resume') await resume(e.session_id)
@@ -238,7 +258,9 @@ export const register: Register = (on, options) => {
   on('tool.call', async ($, e, next) => {
     if (e.tool === 'Bash') {
       const command = String((e as { command?: unknown }).command ?? '')
-      enqueue({ type: 'command', command })
+      const description = (e as { description?: unknown }).description
+      enqueue({ type: 'command', command, description: typeof description === 'string' ? description : undefined })
+      const startedAt = Date.now()
 
       // The text of a file now: a string, null when it does not exist, or
       // undefined when it is no text file to replay (a folder, binary, huge).
@@ -261,6 +283,7 @@ export const register: Register = (on, options) => {
       )
 
       const ran = await next(e)
+      const durationMs = Date.now() - startedAt
 
       const edits: PlayerEvent[] = []
       const seen = new Set<string>()
@@ -282,12 +305,19 @@ export const register: Register = (on, options) => {
       edits.forEach(enqueue)
 
       const text = ran.deny ?? ran.text ?? ''
-      const lines = text
+      const exit = /^Exit code (\d+)/m.exec(text)
+      const all = text
         .split('\n')
         .map(line => line.trimEnd())
-        .filter(line => line.trim() !== '')
-        .slice(0, 3)
-      enqueue({ type: 'output', lines, failed: ran.deny !== undefined || ran.isError === true })
+        .filter(line => line.trim() !== '' && !/^Exit code \d+$/.test(line))
+      enqueue({
+        type: 'output',
+        lines: all.slice(0, 3),
+        total: all.length,
+        failed: ran.deny !== undefined || ran.isError === true,
+        exitCode: exit ? Number(exit[1]) : undefined,
+        durationMs,
+      })
       return ran
     }
 

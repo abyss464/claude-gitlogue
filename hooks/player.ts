@@ -3,7 +3,7 @@
 // the way gitlogue scripts a commit, and `advance` plays the script against the
 // clock. Pacing constants are gitlogue's, as multiples of the typing speed.
 
-import type { GitlogueEvent, GitlogueFileEntry, GitlogueSaved, GitlogueTurn, GitlogueView } from '../types'
+import type { GitlogueEvent, GitlogueFileEntry, GitlogueSaved, GitlogueTermLine, GitlogueTurn, GitlogueView } from '../types'
 import { countChanges, diffLines, type Hunk } from './diff'
 import { Highlighter } from './highlight'
 
@@ -33,6 +33,7 @@ const TAB_WIDTH = 4
 export type TurnInfo = GitlogueTurn
 export type FileEntry = GitlogueFileEntry
 export type PlayerEvent = GitlogueEvent
+export type TermLine = GitlogueTermLine
 
 type FileChange = { path: string; oldLines: string[]; entry: FileEntry }
 
@@ -46,9 +47,10 @@ type StepBody =
   | { k: 'count'; entry: FileEntry }
   | { k: 'dialogOpen' }
   | { k: 'dialogChar'; ch: string }
-  | { k: 'termPrompt' }
+  | { k: 'termLine'; line: TermLine }
   | { k: 'termChar'; ch: string }
-  | { k: 'termOut'; text: string }
+  | { k: 'termResult'; right: string; ok: boolean }
+  | { k: 'termDone'; durationMs: number; aborted: boolean }
   | { k: 'resetTurn'; turn: TurnInfo }
 
 type Step = StepBody & { dur: number }
@@ -122,7 +124,9 @@ export class Player {
   cursorCol = 0
   active: 'editor' | 'terminal' = 'terminal'
   hasFile = false
-  terminal: string[] = []
+  terminal: TermLine[] = []
+  // The word Claude Code closed a turn of this length with (`Cogitated`), when known.
+  wordFor: (durationMs: number) => string | undefined = () => undefined
   dialog: { title: string; text: string } | undefined
   turn: TurnInfo | undefined
   files = new Map<string, FileEntry>()
@@ -183,7 +187,10 @@ export class Player {
     this.active = view.active
     this.hasFile = view.hasFile
     this.isBlank = view.isBlank
-    this.terminal = view.terminal.slice()
+    // Records from before the terminal had structure hold plain strings.
+    this.terminal = view.terminal.map(line =>
+      typeof line === 'string' ? { kind: 'output' as const, text: line } : { ...line },
+    )
     this.turn = view.turn ?? undefined
     this.files = new Map(view.files.map(entry => [entry.path, { ...entry }]))
     this.currentPath = view.currentPath ?? undefined
@@ -202,6 +209,12 @@ export class Player {
     this.checkpoint = this.view()
     this.saveVersion++
     for (const event of saved.pending) this.enqueue(event)
+  }
+
+  // A new row, taking the place of an idle prompt left at the bottom.
+  private addLine(line: TermLine) {
+    if (this.terminal[this.terminal.length - 1]?.kind === 'prompt') this.terminal.pop()
+    this.terminal.push(line)
   }
 
   // Back to an empty pane, as a session with nothing replayed yet.
@@ -231,7 +244,7 @@ export class Player {
       active: this.active,
       hasFile: this.hasFile,
       isBlank: this.isBlank,
-      terminal: this.terminal.slice(),
+      terminal: this.terminal.map(line => ({ ...line })),
       turn: this.turn ?? null,
       files: [...this.files.values()].map(entry => ({ ...entry })),
       currentPath: this.currentPath ?? null,
@@ -261,22 +274,27 @@ export class Player {
         this.scriptEdit(event)
         break
       case 'command':
-        this.push({ k: 'termPrompt' })
+        // The intent arrives whole, as a thought does; the command is typed.
+        if (event.description?.trim()) {
+          this.push({ k: 'termLine', line: { kind: 'intent', text: event.description.trim() } })
+          this.pause(OPEN_CMD_PAUSE)
+        }
+        this.push({ k: 'termLine', line: { kind: 'command', text: '' } })
         for (const ch of cellText(event.command.replace(/\s*\n\s*/g, ' ; ')).slice(0, 240)) this.push({ k: 'termChar', ch }, this.typing())
         this.pause(GIT_ADD_CMD_PAUSE)
         break
-      case 'output':
-        for (const line of event.lines) this.push({ k: 'termOut', text: line })
-        if (event.failed) this.push({ k: 'termOut', text: '✗ exited with an error' })
+      case 'output': {
+        const status = event.failed ? (event.exitCode ? `✗ ${event.exitCode}` : '✗') : '✓'
+        this.push({ k: 'termResult', right: `${formatDuration(event.durationMs, true)} ${status}`, ok: !event.failed })
+        event.lines.forEach((text, i) => this.push({ k: 'termLine', line: { kind: 'output', text, first: i === 0 } }, this.speedMs / 2))
+        if (event.total > event.lines.length)
+          this.push({ k: 'termLine', line: { kind: 'more', text: `… +${event.total - event.lines.length} lines` } })
         this.pause(PUSH_OUTPUT_PAUSE)
         break
+      }
       case 'done':
-        this.push({
-          k: 'termOut',
-          text: event.aborted ? '✗ interrupted' : `✓ done in ${formatDuration(event.durationMs)}`,
-        })
         this.pause(PUSH_OUTPUT_PAUSE)
-        this.push({ k: 'termPrompt' })
+        this.push({ k: 'termDone', durationMs: event.durationMs, aborted: event.aborted })
         break
     }
     for (let i = before; i < this.steps.length; i++) this.remaining += this.steps[i].dur
@@ -341,10 +359,7 @@ export class Player {
     this.filesThisTurn = 0
     this.scriptedPath = undefined
     this.scriptedText = undefined
-    this.push({ k: 'termPrompt' })
-    for (const ch of 'claude') this.push({ k: 'termChar', ch }, this.typing())
-    this.pause(CHECKOUT_PAUSE)
-    this.push({ k: 'termOut', text: `› turn ${turn.id} · ${turn.date}` })
+    this.push({ k: 'termLine', line: { kind: 'rule', text: `${turn.id} · ${turn.date.slice(-8)}` } })
     this.pause(CHECKOUT_OUTPUT_PAUSE)
     this.push({ k: 'resetTurn', turn })
   }
@@ -383,7 +398,7 @@ export class Player {
     this.scriptedText = newLines.join('\n')
     this.scriptHunks(oldLines, hunks)
     this.pause(GIT_ADD_PAUSE)
-    this.push({ k: 'termOut', text: `✓ ${event.path} +${added} -${deleted}` })
+    this.push({ k: 'termLine', line: { kind: 'edit', text: cellText(event.path), right: `+${added} −${deleted}`, ok: true } })
     this.pause(GIT_ADD_CMD_PAUSE)
   }
 
@@ -518,19 +533,40 @@ export class Player {
       case 'dialogChar':
         if (this.dialog) this.dialog.text += step.ch
         break
-      case 'termPrompt':
+      case 'termLine':
         this.active = 'terminal'
-        this.terminal.push('~ ')
+        this.addLine({ ...step.line, text: cellText(step.line.text) })
         break
-      case 'termChar':
+      case 'termChar': {
         this.active = 'terminal'
-        if (this.terminal.length === 0) this.terminal.push('~ ')
-        this.terminal[this.terminal.length - 1] += step.ch
+        const last = this.terminal[this.terminal.length - 1]
+        if (last?.kind === 'command' && last.right === undefined) last.text += step.ch
+        else this.addLine({ kind: 'command', text: step.ch })
         break
-      case 'termOut':
+      }
+      case 'termResult': {
+        // The command still waiting on its result, newest first.
+        for (let i = this.terminal.length - 1; i >= 0; i--) {
+          const line = this.terminal[i]
+          if (line.kind === 'command' && line.right === undefined) {
+            line.right = step.right
+            line.ok = step.ok
+            break
+          }
+        }
+        break
+      }
+      case 'termDone': {
         this.active = 'terminal'
-        this.terminal.push(cellText(step.text))
+        const word = this.wordFor(step.durationMs) ?? 'Done'
+        this.addLine(
+          step.aborted
+            ? { kind: 'fail', text: 'Interrupted' }
+            : { kind: 'done', text: `${word} for ${formatDuration(step.durationMs)}` },
+        )
+        this.addLine({ kind: 'prompt', text: '' })
         break
+      }
       case 'resetTurn':
         this.turn = step.turn
         this.turnVersion++
@@ -547,7 +583,8 @@ export class Player {
   }
 }
 
-function formatDuration(ms: number): string {
+function formatDuration(ms: number, precise = false): string {
+  if (precise && ms < 10000) return `${(ms / 1000).toFixed(1)}s`
   const s = Math.round(ms / 1000)
   if (s < 60) return `${s}s`
   const m = Math.floor(s / 60)

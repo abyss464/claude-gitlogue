@@ -303,6 +303,12 @@ function paintTree(canvas: Canvas, player: Player, theme: Theme, box: Box) {
   }
 }
 
+// Claude's own mark, the one color the terminal keeps whatever the theme.
+const CLAUDE = 0xd77757
+
+// The shell as Claude meets it: what each command is for, the command, the
+// head of what came back, the files written, and how the turn closed. Rows
+// fade as they recede, the way older context does.
 function paintTerminal(canvas: Canvas, player: Player, theme: Theme, box: Box, cursorOn: boolean) {
   const bg = theme.backgroundRight
   canvas.fill(box.x, box.y, box.w, box.h, bg)
@@ -311,15 +317,77 @@ function paintTerminal(canvas: Canvas, player: Player, theme: Theme, box: Box, c
   const lines = player.terminal
   const start = Math.max(0, lines.length - area.h)
   const maxX = area.x + area.w
+  const fit = (text: string, room: number, keepTail = false) =>
+    text.length <= room ? text : room <= 1 ? '' : keepTail ? '…' + text.slice(text.length - room + 1) : text.slice(0, room - 1) + '…'
+
   for (let i = start; i < lines.length; i++) {
-    const y = area.y + i - start
     const line = lines[i]
-    const isCommand = line.startsWith('~ ')
-    let shown = line
-    if (line.length > area.w) shown = isCommand ? line.slice(0, 2) + '…' + line.slice(line.length - area.w + 4) : line.slice(0, area.w - 1) + '…'
-    const end = canvas.text(area.x, y, shown, isCommand ? theme.terminalCommand : theme.terminalOutput, bg, maxX)
-    if (i === lines.length - 1 && isCommand && cursorOn && player.active === 'terminal')
-      canvas.set(Math.min(end, maxX - 1), y, ' ', theme.terminalCursorFg, theme.terminalCursorBg)
+    const y = area.y + i - start
+    const isLast = i === lines.length - 1
+    const age = Math.min(20, (lines.length - 1 - i) * 3)
+    const ink = (color: number) => fade(color, bg, age)
+    let x = area.x
+    const put = (text: string, color: number) => (x = canvas.text(x, y, text, ink(color), bg, maxX))
+    const right = line.right ?? ''
+    const room = (lead: number) => Math.max(0, area.w - lead - (right ? right.length + 2 : 0))
+
+    switch (line.kind) {
+      case 'rule': {
+        const [id = '', time = ''] = line.text.split(' · ')
+        put('── ', theme.separator)
+        put(id, theme.statusHash)
+        put(' · ', theme.separator)
+        put(time, theme.statusDate)
+        put(' ' + '─'.repeat(Math.max(0, maxX - x - 1)), theme.separator)
+        break
+      }
+      case 'intent':
+        put('# ' + fit(line.text, area.w - 2), theme.syntaxComment)
+        break
+      case 'command': {
+        put('❯ ', CLAUDE)
+        const isTyping = line.right === undefined
+        put(fit(line.text, room(2) - (isTyping ? 1 : 0), isTyping), theme.terminalCommand)
+        if (isLast && isTyping && cursorOn && player.active === 'terminal')
+          canvas.set(Math.min(x, maxX - 1), y, ' ', theme.terminalCursorFg, theme.terminalCursorBg)
+        if (right) {
+          const cut = right.indexOf(' ')
+          x = maxX - right.length
+          put(right.slice(0, cut + 1), theme.terminalOutput)
+          put(right.slice(cut + 1), line.ok ? theme.fileTreeAdded : theme.fileTreeDeleted)
+        }
+        break
+      }
+      case 'output':
+        put(line.first ? '  ⎿  ' : '     ', theme.separator)
+        put(fit(line.text, area.w - 5), theme.terminalOutput)
+        break
+      case 'more':
+        put('     ' + fit(line.text, area.w - 5), theme.separator)
+        break
+      case 'edit': {
+        put('✎ ', theme.fileTreeModified)
+        put(fit(line.text, room(2)), theme.terminalCommand)
+        if (right) {
+          const [added = '', deleted = ''] = right.split(' ')
+          x = maxX - right.length
+          put(added + ' ', theme.fileTreeStatsAdded)
+          put(deleted, theme.fileTreeStatsDeleted)
+        }
+        break
+      }
+      case 'done':
+        put('✻ ', CLAUDE)
+        put(fit(line.text, area.w - 2), theme.terminalOutput)
+        break
+      case 'fail':
+        put('✗ ' + fit(line.text, area.w - 2), theme.fileTreeDeleted)
+        break
+      case 'prompt':
+        put('❯ ', CLAUDE)
+        if (isLast && cursorOn) canvas.set(x, y, ' ', theme.terminalCursorFg, theme.terminalCursorBg)
+        break
+    }
   }
 }
 
