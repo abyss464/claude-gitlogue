@@ -69,6 +69,7 @@ export const register: Register = (on, options) => {
   // The conversation reads as a phone chat while the pane is drawn.
   const isChatOn = () => chatOption && mounted !== undefined
   let chatShown = false
+  let shownCounts = -1
   let lastTick = Date.now()
   let sent = { tree: '', main: '' }
   let isBlitting = false
@@ -181,8 +182,12 @@ export const register: Register = (on, options) => {
       }
       player.advance(dt)
       persist()
-      if (isChatOn() !== chatShown) {
+      // The chat coming or going, or the turn's counts moving under it, redraw
+      // the transcript and the turn info.
+      const counts = [...player.files.values()].reduce((n, f) => n + f.added * 7 + f.deleted * 13 + 1, 0)
+      if (isChatOn() !== chatShown || (isChatOn() && counts !== shownCounts)) {
         chatShown = isChatOn()
+        shownCounts = counts
         $.ui.invalidate('ui.render')
       }
       if (player.turnVersion !== shownTurn || player.sceneVersion !== shownScene) {
@@ -500,12 +505,19 @@ export const register: Register = (on, options) => {
         </Text>,
       )
 
+    // With the chat up, the prompt is already in it: the turn's changes stand
+    // where the commit message would.
+    const touched = turn ? [...player.files.values()].filter(entry => entry.turn === turn.id) : []
+    const summary = touched.length === 0
+      ? 'no files changed yet'
+      : `${touched.length} file${touched.length === 1 ? '' : 's'}  +${touched.reduce((n, f) => n + f.added, 0)} -${touched.reduce((n, f) => n + f.deleted, 0)}`
     const info = turn
       ? [
           label('turn: ', turn.id, theme.statusHash),
           label('author: ', 'Claude', theme.statusAuthor),
           label('date: ', turn.date, theme.statusDate),
-          ...turn.prompt
+          ...(isChatOn() ? [label('changes: ', summary, theme.fileTreeModified)] : []),
+          ...(isChatOn() ? '' : turn.prompt)
             .split('\n')
             .filter(line => line.trim() !== '')
             .map(line =>

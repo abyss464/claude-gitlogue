@@ -1,7 +1,8 @@
 // While the replay pane is open, the conversation beside it reads as a chat
 // on a phone, the way two colleagues message: the person's lines in green on
 // the right, marked read; Claude's on the left under its mascot; the tool work
-// left to the pane; a typing line while Claude works.
+// left to the pane; a typing line while Claude works; notices as the small
+// centred notes a chat app shows; and the phone's input bar over the prompt.
 
 import type { On } from 'claude-code'
 
@@ -14,15 +15,10 @@ const INK_ON_MINE = '#0a0a0a'
 const MASCOT = [' ▐▛███▜▌ ', '▝▜█████▛▘', '  ▘▘ ▝▝  ']
 const AVATAR_WIDTH = 10
 const PHONE_WIDTH = 76
-const THEIRS = 0x3a3d47
+const THEIRS = 0x334455
+const BAR = 0x2a3040
+const FIELD = 0x3a4256
 
-export const CHAT_TONE = [
-  'The person is reading this conversation as a LINE-style chat on a phone screen,',
-  'while your tool work is replayed in a pane beside it, as if messaging a colleague',
-  'who sits next to them. Write each reply the way a colleague texts: short, plain',
-  "sentences in the person's language; no headings, tables or long lists unless they",
-  'ask for them; let the pane show the work instead of narrating it.',
-].join(' ')
 
 const isWide = (cp: number) =>
   cp > 0xffff ||
@@ -62,11 +58,12 @@ export function registerChat(on: On, ctx: { isOn: () => boolean; theme: Theme; h
     }
     return stamp
   }
-  // The phone's screen within the transcript: centred, at most a phone wide.
+  // The phone's screen within the transcript: against its right edge, beside
+  // the pane, at most a phone wide.
   const column = (columns: number | undefined) => {
-    const width = Math.max(40, (columns ?? 80) - 2)
+    const width = Math.max(40, (columns ?? 80) - 1)
     const phone = Math.min(width, PHONE_WIDTH)
-    return { phone, margin: Math.floor((width - phone) / 2) }
+    return { phone, margin: width - phone }
   }
   const screen = () => ctx.hex(ctx.theme.backgroundLeft)
 
@@ -105,7 +102,7 @@ export function registerChat(on: On, ctx: { isOn: () => boolean; theme: Theme; h
             </Box>
             <Text color={MINE}>{'▝' + '▀'.repeat(width - 2) + '▘'}</Text>
           </Box>
-          <Box flexDirection="column" width={1}>
+          <Box flexDirection="column" width={1} alignSelf="flex-start">
             <Text> </Text>
             <Text color={MINE}>◥</Text>
           </Box>
@@ -132,7 +129,7 @@ export function registerChat(on: On, ctx: { isOn: () => boolean; theme: Theme; h
           <Box flexDirection="column">
             {first && <Text dimColor>Claude</Text>}
             <Box flexDirection="row" alignItems="flex-end">
-              <Box flexDirection="column" width={1}>
+              <Box flexDirection="column" width={1} alignSelf="flex-start">
                 <Text> </Text>
                 <Text color={fill}>{first ? '◤' : ' '}</Text>
               </Box>
@@ -155,18 +152,61 @@ export function registerChat(on: On, ctx: { isOn: () => boolean; theme: Theme; h
   on('ui.render', { component: 'Spinner' }, ($, e, next) => {
     if (!ctx.isOn() || e.surface !== 'terminal') return next(e)
     const { Box, Text } = $.ui.resolve(e)
-    const { margin } = column(e.viewport?.columns)
+    const { phone, margin } = column(e.viewport?.columns)
     const doing =
       e.props.mode === 'thinking' ? '正在思考…' : e.props.mode === 'tool-use' || e.props.mode === 'tool-input' ? '正在操作…' : '正在输入…'
     return (
-      <Box paddingLeft={margin} flexDirection="row">
-        <Box width={AVATAR_WIDTH}>
-          <Text color={CLAUDE}>{MASCOT[1]}</Text>
+      <Box flexDirection="row">
+        <Box width={margin} />
+        <Box width={phone} backgroundColor={screen()} flexDirection="row" paddingTop={1} paddingLeft={1}>
+          <Box width={AVATAR_WIDTH}>
+            <Text color={CLAUDE}>{MASCOT[1]}</Text>
+          </Box>
+          <Box paddingX={1} backgroundColor={ctx.hex(THEIRS)}>
+            <Text>···</Text>
+          </Box>
+          <Text dimColor> Claude {doing}</Text>
         </Box>
-        <Box paddingX={1} backgroundColor={ctx.hex(ctx.theme.editorCursorLineBg)}>
-          <Text>···</Text>
+      </Box>
+    )
+  })
+
+  // A notice of the engine's (a reload, a setting changed) as a chat app's
+  // small centred note.
+  on('ui.render', { component: 'InfoNotice' }, ($, e, next) => {
+    if (!ctx.isOn() || e.surface !== 'terminal') return next(e)
+    const { Box, Text } = $.ui.resolve(e)
+    const { phone, margin } = column(e.viewport?.columns)
+    const line = (e.props.text.split('\n')[0] ?? '').replace(/\s+/g, ' ').trim()
+    const room = phone - 6
+    return (
+      <Box flexDirection="row">
+        <Box width={margin} />
+        <Box width={phone} backgroundColor={screen()} justifyContent="center" paddingTop={1}>
+          <Box paddingX={1} backgroundColor={ctx.hex(BAR)}>
+            <Text dimColor>{cellWidth(line) > room ? line.slice(0, room - 1) + '…' : line}</Text>
+          </Box>
         </Box>
-        <Text dimColor> Claude {doing}</Text>
+      </Box>
+    )
+  })
+
+  // The bottom of the phone, just over the prompt: LINE's input bar.
+  on('ui.render', { component: 'AbovePrompt' }, ($, e, next) => {
+    if (!ctx.isOn() || e.surface !== 'terminal' || e.props.hasSurvey) return next(e)
+    const { Box, Text } = $.ui.resolve(e)
+    const { phone, margin } = column(e.props.bodyColumns + 1)
+    const bar = ctx.hex(BAR)
+    return (
+      <Box flexDirection="row">
+        <Box width={margin} />
+        <Box width={phone} backgroundColor={bar} flexDirection="row" paddingX={1}>
+          <Text dimColor>＋ ◎ ▣  </Text>
+          <Box flexGrow={1} backgroundColor={ctx.hex(FIELD)} paddingX={1}>
+            <Text dimColor>Aa</Text>
+          </Box>
+          <Text dimColor>  ☺ ♪</Text>
+        </Box>
       </Box>
     )
   })
@@ -193,9 +233,4 @@ export function registerChat(on: On, ctx: { isOn: () => boolean; theme: Theme; h
     return <Box display="none" />
   })
 
-  on('prompt.compose', async ($, e, next) => {
-    const composed = await next(e)
-    if (!ctx.isOn()) return composed
-    return { sections: [...composed.sections, { id: 'gitlogue:chat', text: CHAT_TONE, scope: 'session' as const }] }
-  })
 }
