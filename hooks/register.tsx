@@ -5,6 +5,8 @@
 
 import type { Register } from 'claude-code'
 
+import type { GitlogueSaved } from '../types'
+
 import { candidatePaths, reverseApply, type EngineHunk } from './bashfiles'
 import { layoutFor, paint, type Layout } from './frame'
 import { Player, type PlayerEvent } from './player'
@@ -16,6 +18,12 @@ const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit'])
 const FAST_TICK_MS = 33
 const BLINK_MS = 500
 const MAX_SNAPSHOT_BYTES = 1_000_000
+// The replays kept for /resume: the newest few sessions, each within a share of
+// the 4 MiB store.
+const KEPT_SESSIONS = 3
+const MAX_RECORD_CHARS = 1_000_000
+const RECENT_KEY = 'replays'
+const recordKey = (session: string) => `replay:${session}`
 
 type BashEditFile = { filePath: string; hunks: EngineHunk[]; created?: true; deleted?: true }
 
@@ -67,6 +75,7 @@ export const register: Register = (on, options) => {
   // this module, set up where the session's engine is in reach.
   let schedule = () => {}
   let persist = () => {}
+  let resume = async (_id: string) => {}
 
   const enqueue = (event: PlayerEvent) => {
     player.enqueue(event)
@@ -79,17 +88,68 @@ export const register: Register = (on, options) => {
     cwd = e.cwd
     lastTick = Date.now()
 
+    let session = await $.session.id()
+    const stored = await $.store.get(RECENT_KEY)
+    let recent: string[] = Array.isArray(stored) ? stored.filter((id): id is string => typeof id === 'string') : []
+    let storedAt = 0
+
+    // The replay as a record small enough to keep: everything still to play,
+    // else the panes alone, else the panes without the open file.
+    const record = (): GitlogueSaved => {
+      const full = player.save()
+      if (JSON.stringify(full).length <= MAX_RECORD_CHARS) return full
+      const view = player.view()
+      const panes = { view, pending: [] }
+      if (JSON.stringify(panes).length <= MAX_RECORD_CHARS) return panes
+      return { view: { ...view, lines: [''], hasFile: false, currentPath: null }, pending: [] }
+    }
+
+    // Kept for /resume, at most every couple of seconds while playing and
+    // always once the replay has caught up.
+    const keep = () => {
+      const now = Date.now()
+      if (!player.isIdle && now - storedAt < 2000) return
+      storedAt = now
+      const id = session
+      void $.store.set(recordKey(id), record()).catch(() => {})
+      if (recent[0] === id) return
+      const dropped = recent.filter(other => other !== id).slice(KEPT_SESSIONS - 1)
+      recent = [id, ...recent.filter(other => other !== id)].slice(0, KEPT_SESSIONS)
+      for (const old of dropped) void $.store.delete(recordKey(old)).catch(() => {})
+      void $.store.set(RECENT_KEY, recent).catch(() => {})
+    }
+
     let savedVersion = -1
     persist = () => {
       if (player.saveVersion === savedVersion) return
       savedVersion = player.saveVersion
-      void $.state.set(SAVED, player.save()).catch(() => {})
+      void $.state.set(SAVED, { ...player.save(), session }).catch(() => {})
+      keep()
     }
-    // A reload of this module (an edit, a changed option) resumes the replay.
-    const { value: saved } = await $.state.get(SAVED)
-    if (saved) {
-      player.restore(saved)
-      savedVersion = player.saveVersion
+
+    // The session's last replay, from a reload of this module (an edit, a
+    // changed option) or from an earlier run this session resumes.
+    const load = async () => {
+      const { value: live } = await $.state.get(SAVED)
+      if (live && live.session === session) return player.restore(live)
+      const kept = (await $.store.get(recordKey(session))) as GitlogueSaved | undefined
+      if (kept?.view) {
+        player.restore(kept)
+        player.flush()
+      }
+    }
+    await load()
+    savedVersion = player.saveVersion
+    resume = async (id: string) => {
+      if (id === session) return
+      session = id
+      const kept = (await $.store.get(recordKey(id))) as GitlogueSaved | undefined
+      if (kept?.view) {
+        player.restore(kept)
+        player.flush()
+      } else player.reset()
+      persist()
+      schedule()
     }
 
     const tick = () => {
@@ -141,6 +201,12 @@ export const register: Register = (on, options) => {
     if (openAtStart && e.isInteractive) void $.ui.open({ id: PANE, title: 'gitlogue', rows: 24 })
     // After a reload the pane may still be up, drawn by the module before this one.
     $.ui.invalidate('ui.render')
+    return next(e)
+  })
+
+  // /resume inside a running session switches to another one's replay.
+  on('classic.SessionStart', async ($, e, next) => {
+    if (e.source === 'resume') await resume(e.session_id)
     return next(e)
   })
 

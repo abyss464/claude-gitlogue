@@ -26,7 +26,8 @@ export type GitlogueView = {
   currentPath: string | null
 }
 
-export type GitlogueSaved = { view: GitlogueView; pending: GitlogueEvent[] }
+// `session` names the session the replay belongs to, where it is recorded.
+export type GitlogueSaved = { view: GitlogueView; pending: GitlogueEvent[]; session?: string }
 
 declare module 'claude-code' {
   interface PluginState {

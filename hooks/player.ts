@@ -204,7 +204,26 @@ export class Player {
     for (const event of saved.pending) this.enqueue(event)
   }
 
-  private view(): GitlogueView {
+  // Back to an empty pane, as a session with nothing replayed yet.
+  reset() {
+    this.restore({
+      view: {
+        lines: [''],
+        cursorLine: 0,
+        cursorCol: 0,
+        active: 'terminal',
+        hasFile: false,
+        isBlank: false,
+        terminal: [],
+        turn: null,
+        files: [],
+        currentPath: null,
+      },
+      pending: [],
+    })
+  }
+
+  view(): GitlogueView {
     return {
       lines: this.lines.slice(),
       cursorLine: this.cursorLine,
