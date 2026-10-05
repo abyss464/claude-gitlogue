@@ -309,7 +309,9 @@ export const register: Register = (on, options) => {
           () => null,
         )
       const home = (await $.env.get('HOME')) ?? ''
-      const paths = candidatePaths(command, await $.session.cwd(), home)
+      // The plugins' store is written by this mod itself while commands run.
+      const isOwn = (path: string) => path.startsWith(home + '/.claude/plugins/store/')
+      const paths = candidatePaths(command, await $.session.cwd(), home).filter(path => !isOwn(path))
       const before = new Map<string, string | null>()
       await Promise.all(
         paths.map(async path => {
@@ -332,7 +334,7 @@ export const register: Register = (on, options) => {
       // What the engine saw the command change, for files the command never names.
       const result = 'result' in ran ? (ran.result as { bashEditDiff?: { files?: BashEditFile[] } } | undefined) : undefined
       for (const file of result?.bashEditDiff?.files ?? []) {
-        if (file.deleted || seen.has(file.filePath)) continue
+        if (file.deleted || seen.has(file.filePath) || isOwn(file.filePath)) continue
         const now = await look(file.filePath).catch(() => undefined)
         if (typeof now !== 'string') continue
         const old = file.created ? '' : reverseApply(now, file.hunks)
