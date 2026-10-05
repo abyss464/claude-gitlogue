@@ -49,7 +49,10 @@ const MAX_READ_SWEEP = 120
 const FLY_STEPS = 16
 const DOWNLOAD_STEPS = 28
 
-type Screen = 'code' | 'browser' | 'image'
+type Screen = 'code' | 'browser' | 'image' | 'cast'
+
+// A recording of one of Claude's own screens, as it plays.
+export type Cast = { screen: string; width: number; height: number; speed: number; seconds: number }
 
 const EMPTY_BROWSER: GitlogueBrowser = {
   url: '',
@@ -110,6 +113,9 @@ type StepBody =
   | { k: 'flyStart'; file: string }
   | { k: 'fly'; t: number }
   | { k: 'trash'; file: string }
+  | { k: 'castStart'; cast: Cast }
+  | { k: 'castFrame'; file: string }
+  | { k: 'castEnd'; remove: string[] }
   | { k: 'dialogOpen' }
   | { k: 'dialogChar'; ch: string }
   | { k: 'termLine'; line: TermLine }
@@ -214,6 +220,11 @@ export class Player {
   palette: GitloguePalette | undefined
   flight: GitlogueFlight | undefined
   trashed = 0
+  // A screen recording playing in the editor's area, its current frame, and
+  // the files played through, for the pane to delete.
+  cast: Cast | undefined
+  castFrame: string | undefined
+  removals: string[] = []
   private planSidebar: 'explorer' | 'search' = 'explorer'
   // Bumped when the screen or its picture changes, for the drawing that holds it.
   sceneVersion = 0
@@ -267,7 +278,8 @@ export class Player {
   // The replay as it stands: the panes at the oldest unfinished event, and the
   // events from there on, to pick up after a reload.
   save(): GitlogueSaved {
-    return { view: this.checkpoint, pending: this.segments.map(segment => segment.event) }
+    // A recording's frames do not outlive this load: it is not kept to replay.
+    return { view: this.checkpoint, pending: this.segments.map(segment => segment.event).filter(event => event.type !== 'cast') }
   }
 
   restore(saved: GitlogueSaved) {
@@ -286,7 +298,7 @@ export class Player {
     this.files = new Map(view.files.map(entry => [entry.path, { ...entry }]))
     this.currentPath = view.currentPath ?? undefined
     this.explorer = Explorer.from(view.explorer)
-    this.screen = view.screen ?? 'code'
+    this.screen = view.screen === 'cast' ? 'code' : (view.screen ?? 'code')
     this.browser = view.browser ? { ...view.browser, results: view.browser.results.slice(), body: view.browser.body.slice() } : { ...EMPTY_BROWSER }
     this.image = view.image ? { ...view.image } : undefined
     this.marks = view.marks ? { ...view.marks } : undefined
@@ -440,6 +452,9 @@ export class Player {
         break
       case 'delete':
         this.scriptDelete(event)
+        break
+      case 'cast':
+        this.scriptCast(event)
         break
       case 'done':
         this.pause(PUSH_OUTPUT_PAUSE)
@@ -849,6 +864,26 @@ export class Player {
     this.pause(GIT_ADD_CMD_PAUSE)
   }
 
+  // A recording of Claude at work on one of its screens, played in the
+  // editor's area frame by frame at its own pace, then let go.
+  private scriptCast(event: Extract<PlayerEvent, { type: 'cast' }>) {
+    if (event.frames.length === 0) {
+      this.push({ k: 'castEnd', remove: event.remove }, 0)
+      return
+    }
+    const speed = Math.round(event.speed * 10) / 10
+    this.push({
+      k: 'termLine',
+      line: { kind: 'cast', text: `screen ${event.screen} · ${event.seconds.toFixed(1)}s`, right: `×${speed}` },
+    })
+    this.push({ k: 'castStart', cast: { screen: event.screen, width: event.width, height: event.height, speed, seconds: event.seconds } }, 0)
+    this.planScreen = 'cast'
+    for (const file of event.frames) this.push({ k: 'castFrame', file }, 1000 / event.fps)
+    this.pause(CHECKOUT_OUTPUT_PAUSE)
+    this.push({ k: 'castEnd', remove: event.remove }, 0)
+    this.planScreen = 'code'
+  }
+
   private scriptHunks(oldLines: string[], hunks: Hunk[]) {
     // The buffer as the script leaves it, for where the cursor lands.
     const buffer = oldLines.slice()
@@ -1036,6 +1071,22 @@ export class Player {
         this.trashed++
         break
       }
+      case 'castStart':
+        this.cast = step.cast
+        this.castFrame = undefined
+        this.setScreen('cast')
+        break
+      case 'castFrame':
+        // The first frame mounts the picture; the rest are swapped into it.
+        if (!this.castFrame) this.sceneVersion++
+        this.castFrame = step.file
+        break
+      case 'castEnd':
+        this.cast = undefined
+        this.castFrame = undefined
+        this.removals.push(...step.remove)
+        if (this.screen === 'cast') this.setScreen('code')
+        break
       case 'backspace': {
         this.active = 'editor'
         const text = this.lines[step.line] ?? ''

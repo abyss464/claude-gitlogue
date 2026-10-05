@@ -20,6 +20,12 @@ const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit'])
 const FAST_TICK_MS = 33
 const BLINK_MS = 500
 const MAX_SNAPSHOT_BYTES = 1_000_000
+// The tools of the server that gives Claude screens of its own.
+const SCREENS_TOOL = 'mcp__hypr-screens__'
+// Recordings play at twice their speed or faster, at most this many frames a second.
+const CAST_SPEED = 2
+const CAST_FPS_LIMIT = 30
+const CAST_LONGEST_PLAY_SECONDS = 8
 // With the chat in it, the pane asks to take nearly the whole width: the
 // transcript beside it has nothing left to show.
 const WIDE_DOCK = 400
@@ -75,6 +81,16 @@ export const register: Register = (on, options) => {
   let shownCounts = -1
   // How wide the phone was last drawn: the wheel left of it scrolls the chat.
   let phoneShown = 0
+  // Recordings of Claude's own screens, when the hypr-screens server is here:
+  // the pane marks that it watches, finds new clips, and plays them.
+  let castEnabled = false
+  let runtimeDir = ''
+  let viewerMark = ''
+  let lastMark = 0
+  let lastPoll = 0
+  let isDecoding = false
+  let shownCastFrame: string | undefined
+  const seenClips = new Set<string>()
   let shownChat = -1
   let lastTick = Date.now()
   let sent = { tree: '', main: '' }
@@ -110,6 +126,9 @@ export const register: Register = (on, options) => {
 
   on('session.start', async ($, e, next) => {
     cwd = e.cwd
+    runtimeDir = (await $.env.get('XDG_RUNTIME_DIR')) ?? ''
+    // Nothing of the screen recordings loads unless their server is connected.
+    castEnabled = (await $.tool.list().catch(() => [])).some(tool => tool.name.startsWith(SCREENS_TOOL))
     chat.load(await $.session.messages().catch(() => []))
     lastTick = Date.now()
 
@@ -189,6 +208,12 @@ export const register: Register = (on, options) => {
       }
       player.advance(dt)
       persist()
+      watchScreens()
+      if (player.removals.length > 0) void $.process.run(['rm', '-rf', ...player.removals.splice(0)]).catch(() => {})
+      if (player.screen === 'cast' && player.castFrame && player.castFrame !== shownCastFrame) {
+        shownCastFrame = player.castFrame
+        void $.ui.blit({ requestId: PANE, key: 'cast', source: { file: player.castFrame, format: 'png' } }).catch(() => {})
+      }
       // The chat coming or going, or the turn's counts moving under it, redraw
       // the transcript and the turn info.
       const counts = [...player.files.values()].reduce((n, f) => n + f.added * 7 + f.deleted * 13 + 1, 0)
@@ -219,6 +244,64 @@ export const register: Register = (on, options) => {
         }
       }
       schedule()
+    }
+
+    // While the pane is open and the screens' server is here: a mark that the
+    // pane watches (the server records only while one is fresh), and a look
+    // for clips it has finished.
+    const watchScreens = () => {
+      if (!castEnabled || !mounted || !runtimeDir) return
+      const now = Date.now()
+      if (now - lastMark > 10_000) {
+        lastMark = now
+        viewerMark = `${runtimeDir}/hypr-screens/viewers/gitlogue-${session}`
+        void $.fs.write(viewerMark, String(now)).catch(() => {})
+      }
+      if (isDecoding || now - lastPoll < 1000) return
+      lastPoll = now
+      isDecoding = true
+      void takeClips().finally(() => (isDecoding = false))
+    }
+
+    // Each new clip, decoded to frames at the speed it plays at, and queued.
+    const takeClips = async () => {
+      const dir = `${runtimeDir}/hypr-screens/recordings`
+      const notes = (await $.fs.list(dir).catch(() => []))
+        .map(entry => entry.name)
+        .filter(name => name.endsWith('.json') && !seenClips.has(name))
+        .sort()
+      for (const name of notes) {
+        seenClips.add(name)
+        const note = JSON.parse(String(await $.fs.read(`${dir}/${name}`).catch(() => '{}'))) as {
+          screen?: string
+          file?: string
+          width?: number
+          height?: number
+          seconds?: number
+        }
+        if (!note.file) continue
+        const seconds = note.seconds ?? 0
+        const speed = Math.max(CAST_SPEED, seconds / CAST_LONGEST_PLAY_SECONDS)
+        const fps = Math.min(CAST_FPS_LIMIT, 15 * speed)
+        const frames = note.file.replace(/\.mp4$/, '-frames')
+        const remove = [note.file, `${dir}/${name}`, frames]
+        await $.process.run(['mkdir', '-p', frames]).catch(() => undefined)
+        const made = await $.process
+          .run(['ffmpeg', '-v', 'error', '-y', '-i', note.file, '-vf', `setpts=PTS/${speed},fps=${fps},scale=960:-2`, `${frames}/f%04d.png`], { timeoutMs: 120_000 })
+          .catch(() => undefined)
+        const list = made?.exitCode === 0 ? (await $.fs.list(frames).catch(() => [])).map(entry => entry.name).filter(n => n.endsWith('.png')).sort() : []
+        enqueue({
+          type: 'cast',
+          screen: note.screen ?? '?',
+          frames: list.map(n => `${frames}/${n}`),
+          fps,
+          speed,
+          seconds,
+          width: note.width ?? 1600,
+          height: note.height ?? 1000,
+          remove,
+        })
+      }
     }
 
     schedule = () => {
@@ -304,6 +387,8 @@ export const register: Register = (on, options) => {
 
   on('ui.close', { id: PANE }, ($, e, next) => {
     mounted = undefined
+    if (viewerMark) void $.process.run(['rm', '-f', viewerMark]).catch(() => {})
+    lastMark = 0
     chatShown = false
     $.ui.invalidate('ui.render')
     schedule()
@@ -325,6 +410,7 @@ export const register: Register = (on, options) => {
   })
 
   on('tool.call', async ($, e, next) => {
+    if (String(e.tool).startsWith(SCREENS_TOOL)) castEnabled = true
     // Where a changed file sits for the explorer: the session's folder when it
     // is inside it, else the repository holding it, else its own folder, with
     // each folder listed from there down.
@@ -590,6 +676,8 @@ export const register: Register = (on, options) => {
 
     const turn = player.turn
     const picture = player.screen === 'image' && player.image ? imageBox(layout, player.image) : undefined
+    const castBox = player.screen === 'cast' && player.cast && player.castFrame ? imageBox(layout, player.cast) : undefined
+    shownCastFrame = castBox ? player.castFrame : undefined
     const left = hex(theme.backgroundLeft)
     // Each row keeps its height; what does not fit is cut at the bottom.
     const row = (text: ReturnType<typeof Text>) => <Box flexShrink={0}>{text}</Box>
@@ -655,6 +743,17 @@ export const register: Register = (on, options) => {
         )}
         <Box width={layout.rightWidth} height={height}>
           <Raster key="main" columns={layout.rightWidth} rows={height} cells={frame.main} />
+          {castBox && player.castFrame && (
+            <Box position="absolute" top={castBox.top} left={castBox.left}>
+              <Image
+                key="cast"
+                source={{ file: player.castFrame, format: 'png' }}
+                columns={castBox.columns}
+                rows={castBox.rows}
+                alt={`screen ${player.cast?.screen ?? ''}`}
+              />
+            </Box>
+          )}
           {picture && player.image && (
             <Box position="absolute" top={picture.top} left={picture.left}>
               <Image

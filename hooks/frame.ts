@@ -178,6 +178,7 @@ export function paint(player: Player, theme: Theme, layout: Layout, cursorOn: bo
   const editorBox = { x: leftWidth, y: 0, w: rightWidth, h: topRows }
   if (player.screen === 'browser') paintBrowser(canvas, player, theme, editorBox, cursorOn)
   else if (player.screen === 'image' && player.image) paintViewer(canvas, player, theme, editorBox)
+  else if (player.screen === 'cast' && player.cast) paintCast(canvas, player, theme, editorBox)
   else paintEditor(canvas, player, theme, editorBox, cursorOn)
   if (bottomRows > 0) {
     canvas.text(leftWidth, topRows, '─'.repeat(rightWidth), theme.separator, theme.backgroundRight)
@@ -371,6 +372,20 @@ function paintViewer(canvas: Canvas, player: Player, theme: Theme, box: Box) {
   let x = canvas.text(area.x, area.y, '▣ ', theme.fileTreeModified, bg)
   x = canvas.text(x, area.y, image.path, theme.fileTreeCurrentFileFg, bg, area.x + area.w)
   canvas.text(x, area.y, `  ${image.width}×${image.height}`, theme.editorLineNumber, bg, area.x + area.w)
+  canvas.text(area.x, area.y + 1, '─'.repeat(area.w), theme.separator, bg)
+}
+
+// A recording of one of Claude's screens: which screen, its size and the
+// speed it plays at above; the frames themselves are laid over by the pane.
+function paintCast(canvas: Canvas, player: Player, theme: Theme, box: Box) {
+  const bg = theme.backgroundRight
+  canvas.fill(box.x, box.y, box.w, box.h, bg)
+  const area = inner(box)
+  const cast = player.cast
+  if (!cast || area.w <= 0 || area.h <= 0) return
+  let x = canvas.text(area.x, area.y, '● ', theme.fileTreeDeleted, bg)
+  x = canvas.text(x, area.y, `screen ${cast.screen}`, theme.fileTreeCurrentFileFg, bg, area.x + area.w)
+  canvas.text(x, area.y, `  ${cast.width}×${cast.height}  ×${cast.speed}`, theme.editorLineNumber, bg, area.x + area.w)
   canvas.text(area.x, area.y + 1, '─'.repeat(area.w), theme.separator, bg)
 }
 
@@ -750,6 +765,14 @@ function paintTerminal(canvas: Canvas, player: Player, theme: Theme, box: Box, c
         put(' ' + fit(line.text, Math.max(0, maxX - x - 1)), theme.terminalCommand)
         break
       }
+      case 'cast':
+        put('▶ ', theme.fileTreeDeleted)
+        put(fit(line.text, Math.max(0, maxX - x - (right ? right.length + 2 : 0))), theme.terminalCommand)
+        if (right) {
+          x = maxX - right.length
+          put(right, theme.editorLineNumber)
+        }
+        break
       case 'trash':
         put('✗ ', theme.fileTreeDeleted)
         put('moved to trash  ', theme.terminalOutput)

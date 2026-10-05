@@ -87,12 +87,13 @@ export type GitlogueEvent =
   | { type: 'findfiles'; pattern: string; files: string[] }
   | { type: 'git'; commit?: { sha: string; branch?: string; message?: string }; push?: { branch: string }; root?: string; durationMs: number }
   | { type: 'delete'; path: string; file: string; isDir: boolean; place?: GitloguePlace }
+  | { type: 'cast'; screen: string; frames: string[]; fps: number; speed: number; seconds: number; width: number; height: number; remove: string[] }
 
 // One row of the terminal pane, as Claude meets a shell: the turn it belongs
 // to, what a command is for, the command, what came back, the files it wrote,
 // and how the turn ended.
 export type GitlogueTermLine = {
-  kind: 'rule' | 'intent' | 'command' | 'output' | 'more' | 'edit' | 'done' | 'fail' | 'prompt' | 'progress' | 'commit' | 'trash'
+  kind: 'rule' | 'intent' | 'command' | 'output' | 'more' | 'edit' | 'done' | 'fail' | 'prompt' | 'progress' | 'commit' | 'trash' | 'cast'
   text: string
   // Drawn flush right: a command's time and status, an edit's line counts.
   right?: string
@@ -123,7 +124,7 @@ export type GitlogueView = {
   files: GitlogueFileEntry[]
   currentPath: string | null
   explorer?: GitlogueExplorer
-  screen?: 'code' | 'browser' | 'image'
+  screen?: 'code' | 'browser' | 'image' | 'cast'
   browser?: GitlogueBrowser
   image?: GitlogueImage
   // Lines read with the highlighter: whole lines from `from` up to `line`,
