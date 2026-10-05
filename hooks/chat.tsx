@@ -19,7 +19,8 @@ const MASCOT = [' ▐▛███▜▌ ', '▝▜█████▛▘', '  ▘
 const AVATAR_WIDTH = 10
 const KEPT_MESSAGES = 60
 
-export type ChatLine = { role: 'me' | 'claude'; text: string; time?: string }
+// `isRead` marks a line of the person's that has reached Claude.
+export type ChatLine = { role: 'me' | 'claude'; text: string; time?: string; isRead?: boolean }
 
 const isWide = (cp: number) =>
   cp > 0xffff ||
@@ -75,8 +76,16 @@ export class Chat {
     this.lines = []
     for (const message of messages) {
       const text = message.role === 'user' ? spoken(message.text) : message.text.trim()
-      if (text) this.add({ role: message.role === 'user' ? 'me' : 'claude', text })
+      if (text) this.add({ role: message.role === 'user' ? 'me' : 'claude', text, isRead: true })
     }
+  }
+
+  // The oldest of the person's lines still on its way has reached Claude.
+  markRead() {
+    const line = this.lines.find(other => other.role === 'me' && !other.isRead)
+    if (!line) return
+    line.isRead = true
+    this.version++
   }
 
   working(isWorking: boolean) {
@@ -106,7 +115,7 @@ export function drawPhone(
       return (
         <Box flexDirection="row" justifyContent="flex-end" alignItems="flex-end" marginTop={1} flexShrink={0}>
           <Box flexDirection="column" alignItems="flex-end" marginRight={1}>
-            <Text dimColor>已读</Text>
+            {line.isRead && <Text dimColor>已读</Text>}
             {line.time && <Text dimColor>{line.time}</Text>}
           </Box>
           <Box flexDirection="column" width={bubble}>
@@ -197,15 +206,28 @@ export function registerChat(on: On, ctx: { isOn: () => boolean; chat: Chat }) {
   on('prompt.submit', ($, e, next) => {
     if (e.origin.kind === 'composer' || e.origin.kind === 'bridge') {
       const images = e.attachments?.length ? ` [${e.attachments.length} 张图片]` : ''
-      chat.add({ role: 'me', text: e.text.trim() + images, time: now() })
+      chat.add({ role: 'me', text: e.text.trim() + images, time: now(), isRead: false })
       $.ui.invalidate('ui.render')
     }
     return next(e)
   })
 
-  // Each block of Claude's reply as it is stored.
+  // Each block of Claude's reply as it is stored; and the person's prompts as
+  // they reach the conversation, idle or folded into a running turn, which is
+  // when they are read.
   on('session.append', async ($, e, next) => {
     const stored = await next(e)
+    const sender = (e.origin as { kind?: string }).kind
+    if (
+      (e.door === 'prompt' || e.door === 'delivery') &&
+      e.agentId === undefined &&
+      e.message.role === 'user' &&
+      !e.message.isMeta &&
+      (sender === 'composer' || sender === 'bridge')
+    ) {
+      chat.markRead()
+      $.ui.invalidate('ui.render')
+    }
     if (e.door === 'response' && e.agentId === undefined && e.message.role === 'assistant') {
       const text = e.message.content
         .flatMap(block => (block.type === 'text' && typeof block.text === 'string' ? [block.text] : []))
