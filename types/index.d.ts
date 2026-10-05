@@ -3,12 +3,36 @@
 
 export type GitlogueTurn = { id: string; date: string; prompt: string }
 
-// `turn` is the id of the turn that last changed the file.
-export type GitlogueFileEntry = { path: string; status: '+' | '~'; added: number; deleted: number; turn?: string }
+// `turn` is the id of the turn that last changed the file; `file` its
+// absolute path, where the explorer shows it.
+export type GitlogueFileEntry = {
+  path: string
+  status: '+' | '~'
+  added: number
+  deleted: number
+  turn?: string
+  file?: string
+}
+
+// One entry of a directory as the explorer lists it.
+export type GitlogueDirEntry = { name: string; dir: boolean }
+
+// Where a changed file sits: the workspace it belongs to (its repository, or
+// the session's folder) and the listing of each directory from there down.
+export type GitloguePlace = { root: string; listings: Record<string, GitlogueDirEntry[]> }
+
+// The file explorer: its workspace roots, the folders opened, what each
+// listed, and the row the selection is on; paths are absolute.
+export type GitlogueExplorer = {
+  roots: string[]
+  expanded: string[]
+  listings: Record<string, GitlogueDirEntry[]>
+  selected: string | null
+}
 
 export type GitlogueEvent =
   | { type: 'turn'; turn: GitlogueTurn }
-  | { type: 'edit'; path: string; before: string; after: string; created: boolean }
+  | { type: 'edit'; path: string; before: string; after: string; created: boolean; file?: string; place?: GitloguePlace }
   | { type: 'command'; command: string; description?: string }
   | { type: 'output'; lines: string[]; total: number; failed: boolean; exitCode?: number; durationMs: number }
   | { type: 'done'; durationMs: number; aborted: boolean }
@@ -31,13 +55,14 @@ export type GitlogueView = {
   lines: string[]
   cursorLine: number
   cursorCol: number
-  active: 'editor' | 'terminal'
+  active: 'editor' | 'terminal' | 'explorer'
   hasFile: boolean
   isBlank: boolean
   terminal: GitlogueTermLine[]
   turn: GitlogueTurn | null
   files: GitlogueFileEntry[]
   currentPath: string | null
+  explorer?: GitlogueExplorer
 }
 
 // `session` names the session the replay belongs to, where it is recorded.

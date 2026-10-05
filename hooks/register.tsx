@@ -5,9 +5,10 @@
 
 import type { Register } from 'claude-code'
 
-import type { GitlogueSaved } from '../types'
+import type { GitloguePlace, GitlogueSaved } from '../types'
 
 import { candidatePaths, reverseApply, type EngineHunk } from './bashfiles'
+import { chainTo, parentOf, type DirEntry } from './explorer'
 import { layoutFor, paint, type Layout } from './frame'
 import { Player, type PlayerEvent } from './player'
 import { DEFAULT_THEME, THEMES } from './themes'
@@ -259,6 +260,38 @@ export const register: Register = (on, options) => {
   })
 
   on('tool.call', async ($, e, next) => {
+    // Where a changed file sits for the explorer: the session's folder when it
+    // is inside it, else the repository holding it, else its own folder, with
+    // each folder listed from there down.
+    const placeOf = async (file: string): Promise<GitloguePlace | undefined> => {
+      const home = (await $.env.get('HOME')) ?? ''
+      const folder = parentOf(file)
+      let root: string | undefined
+      if (cwd && cwd !== home && file.startsWith(cwd + '/')) root = cwd
+      for (let dir = folder; !root && dir !== '/' && dir !== home; dir = parentOf(dir))
+        if (await $.fs.exists(dir + '/.git').catch(() => false)) root = dir
+      root ??= folder
+      const listings: Record<string, DirEntry[]> = {}
+      for (const dir of chainTo(root, file)) {
+        const entries = await $.fs.list(dir).catch(() => undefined)
+        if (!entries) return undefined
+        listings[dir] = entries
+          .filter(entry => entry.name !== '.git')
+          .slice(0, 400)
+          .map(entry => ({ name: entry.name, dir: entry.kind === 'dir' }))
+      }
+      return { root, listings }
+    }
+    const editOf = async (file: string, before: string, after: string, created: boolean): Promise<PlayerEvent> => ({
+      type: 'edit',
+      path: display(file),
+      before,
+      after,
+      created,
+      file,
+      place: await placeOf(file).catch(() => undefined),
+    })
+
     if (e.tool === 'Bash') {
       const command = String((e as { command?: unknown }).command ?? '')
       const description = (e as { description?: unknown }).description
@@ -294,7 +327,7 @@ export const register: Register = (on, options) => {
         const now = await look(path).catch(() => undefined)
         if (typeof now !== 'string' || now === old) continue
         seen.add(path)
-        edits.push({ type: 'edit', path: display(path), before: old ?? '', after: now, created: old === null })
+        edits.push(await editOf(path, old ?? '', now, old === null))
       }
       // What the engine saw the command change, for files the command never names.
       const result = 'result' in ran ? (ran.result as { bashEditDiff?: { files?: BashEditFile[] } } | undefined) : undefined
@@ -303,7 +336,7 @@ export const register: Register = (on, options) => {
         const now = await look(file.filePath).catch(() => undefined)
         if (typeof now !== 'string') continue
         const old = file.created ? '' : reverseApply(now, file.hunks)
-        if (old !== now) edits.push({ type: 'edit', path: display(file.filePath), before: old, after: now, created: file.created === true })
+        if (old !== now) edits.push(await editOf(file.filePath, old, now, file.created === true))
       }
       edits.forEach(enqueue)
 
@@ -334,8 +367,7 @@ export const register: Register = (on, options) => {
     const ran = await next(e)
     if (!path || ran.deny !== undefined || ran.isError === true) return ran
     const after = await read()
-    if (after !== undefined && after !== before)
-      enqueue({ type: 'edit', path: display(path), before: before ?? '', after, created: before === undefined })
+    if (after !== undefined && after !== before) enqueue(await editOf(path, before ?? '', after, before === undefined))
     return ran
   })
 

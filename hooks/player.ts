@@ -3,8 +3,17 @@
 // the way gitlogue scripts a commit, and `advance` plays the script against the
 // clock. Pacing constants are gitlogue's, as multiples of the typing speed.
 
-import type { GitlogueEvent, GitlogueFileEntry, GitlogueSaved, GitlogueTermLine, GitlogueTurn, GitlogueView } from '../types'
+import type {
+  GitlogueEvent,
+  GitlogueFileEntry,
+  GitloguePlace,
+  GitlogueSaved,
+  GitlogueTermLine,
+  GitlogueTurn,
+  GitlogueView,
+} from '../types'
 import { countChanges, diffLines, type Hunk } from './diff'
+import { chainTo, Explorer, nameOf, type DirEntry } from './explorer'
 import { Highlighter } from './highlight'
 
 const CURSOR_MOVE_PAUSE = 0.5
@@ -28,6 +37,8 @@ const GIT_ADD_CMD_PAUSE = 16.7
 const PUSH_OUTPUT_PAUSE = 10.0
 
 const MAX_TERMINAL_LINES = 300
+const EXPAND_PAUSE = 6.0
+const SELECT_STEP_PAUSE = 1.5
 // Past these a change is a machine's output, not something typed: it is
 // counted in the tree and noted in the terminal, never replayed key by key.
 const MAX_TYPED_LINE = 1000
@@ -53,6 +64,10 @@ type StepBody =
   | { k: 'pause' }
   | { k: 'switchFile'; change: FileChange }
   | { k: 'count'; entry: FileEntry }
+  | { k: 'root'; root: string }
+  | { k: 'list'; dir: string; entries: DirEntry[]; ensure?: DirEntry }
+  | { k: 'expand'; dir: string }
+  | { k: 'select'; path: string }
   | { k: 'dialogOpen' }
   | { k: 'dialogChar'; ch: string }
   | { k: 'termLine'; line: TermLine }
@@ -130,7 +145,7 @@ export class Player {
   lines: string[] = ['']
   cursorLine = 0
   cursorCol = 0
-  active: 'editor' | 'terminal' = 'terminal'
+  active: 'editor' | 'terminal' | 'explorer' = 'terminal'
   hasFile = false
   terminal: TermLine[] = []
   // The word Claude Code closed a turn of this length with (`Cogitated`), when known.
@@ -143,6 +158,10 @@ export class Player {
   // Bumped whenever the turn shown changes, for the drawing that shows it.
   turnVersion = 0
 
+  // The explorer the panes draw, and the copy the script walks ahead on.
+  explorer = new Explorer()
+  private plan = new Explorer()
+  private planKeep = new Set<string>()
   // A file that starts empty shows one blank line, which its first typed line takes over.
   private isBlank = false
   private steps: Step[] = []
@@ -202,6 +221,9 @@ export class Player {
     this.turn = view.turn ?? undefined
     this.files = new Map(view.files.map(entry => [entry.path, { ...entry }]))
     this.currentPath = view.currentPath ?? undefined
+    this.explorer = Explorer.from(view.explorer)
+    this.plan = this.explorer.clone()
+    this.planKeep = new Set(view.files.flatMap(entry => (entry.file ? [entry.file] : [])))
     this.dialog = undefined
     if (view.hasFile && view.currentPath) this.highlighter.setPath(view.currentPath)
     this.turnVersion++
@@ -256,6 +278,7 @@ export class Player {
       turn: this.turn ?? null,
       files: [...this.files.values()].map(entry => ({ ...entry })),
       currentPath: this.currentPath ?? null,
+      explorer: this.explorer.save(),
     }
   }
 
@@ -379,7 +402,7 @@ export class Player {
     const skipped = untypeable(event.path, hunks)
     if (skipped) {
       this.pause(CHECKOUT_PAUSE)
-      this.push({ k: 'count', entry: { path: event.path, status: event.created ? '+' : '~', added, deleted } })
+      this.push({ k: 'count', entry: { path: event.path, status: event.created ? '+' : '~', added, deleted, file: event.file } })
       this.push({
         k: 'termLine',
         line: { kind: 'edit', text: `${cellText(event.path)} · ${skipped}, not replayed`, right: `+${added} −${deleted}`, ok: true },
@@ -390,7 +413,7 @@ export class Player {
     const change: FileChange = {
       path: event.path,
       oldLines,
-      entry: { path: event.path, status: event.created ? '+' : '~', added, deleted },
+      entry: { path: event.path, status: event.created ? '+' : '~', added, deleted, file: event.file },
     }
 
     // The file already open, as the last change left it: keep typing in place.
@@ -399,6 +422,11 @@ export class Player {
       this.pause(CHECKOUT_PAUSE)
     } else if (isOpen) {
       this.pause(OPEN_CMD_PAUSE)
+      this.push({ k: 'switchFile', change })
+      this.pause(FILE_SWITCH_PAUSE)
+    } else if (event.file && event.place) {
+      this.pause(this.filesThisTurn++ === 0 ? OPEN_FILE_FIRST_PAUSE : OPEN_FILE_PAUSE)
+      this.scriptNavigate(event.file, event.place)
       this.push({ k: 'switchFile', change })
       this.pause(FILE_SWITCH_PAUSE)
     } else {
@@ -417,6 +445,59 @@ export class Player {
     this.pause(GIT_ADD_PAUSE)
     this.push({ k: 'termLine', line: { kind: 'edit', text: cellText(event.path), right: `+${added} −${deleted}`, ok: true } })
     this.pause(GIT_ADD_CMD_PAUSE)
+  }
+
+  // Walks the explorer to `file` as a person would: down from where the
+  // selection is, opening each closed folder on the way, then onto the file.
+  private scriptNavigate(file: string, place: GitloguePlace) {
+    const plan = this.plan
+    if (!plan.roots.includes(place.root)) {
+      this.push({ k: 'root', root: place.root })
+      plan.addRoot(place.root)
+    }
+    const chain = chainTo(place.root, file)
+    chain.forEach((dir, i) => {
+      const entries = place.listings[dir]
+      if (!entries) return
+      const ensure = { name: nameOf(chain[i + 1] ?? file), dir: i + 1 < chain.length }
+      this.push({ k: 'list', dir, entries, ensure }, 0)
+      plan.list(dir, entries, ensure)
+    })
+    this.planKeep.add(file)
+    for (const dir of chain) {
+      if (plan.expanded.has(dir)) continue
+      this.scriptSelect(dir)
+      this.pause(EXPAND_PAUSE)
+      this.push({ k: 'expand', dir })
+      plan.expanded.add(dir)
+      this.pause(EXPAND_PAUSE * 1.5)
+    }
+    this.scriptSelect(file)
+    this.pause(OPEN_CMD_PAUSE)
+  }
+
+  // The selection stepping row by row to `target`, easing in and out.
+  private scriptSelect(target: string) {
+    const plan = this.plan
+    const rows = plan.rows(this.planKeep)
+    const to = rows.findIndex(row => row.path === target)
+    const from = Math.max(0, rows.findIndex(row => row.path === plan.selected))
+    if (to >= 0 && to !== from) {
+      const distance = Math.abs(to - from)
+      const count = Math.min(distance, MAX_SCROLL_STEPS)
+      let last = from
+      for (let i = 1; i <= count; i++) {
+        const t = i / count
+        const eased = t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2
+        const index = Math.round(from + (to - from) * eased)
+        if (index === last) continue
+        last = index
+        this.push({ k: 'select', path: rows[index].path }, 0)
+        this.pause(SELECT_STEP_PAUSE)
+      }
+    }
+    if (plan.selected !== target) this.push({ k: 'select', path: target }, 0)
+    plan.selected = target
   }
 
   private scriptHunks(oldLines: string[], hunks: Hunk[]) {
@@ -533,6 +614,20 @@ export class Player {
         this.currentPath = step.change.path
         break
       }
+      case 'root':
+        this.explorer.addRoot(step.root)
+        break
+      case 'list':
+        this.explorer.list(step.dir, step.entries, step.ensure)
+        break
+      case 'expand':
+        this.active = 'explorer'
+        this.explorer.expanded.add(step.dir)
+        break
+      case 'select':
+        this.active = 'explorer'
+        this.explorer.selected = step.path
+        break
       case 'count': {
         const known = this.files.get(step.entry.path)
         const turn = this.turn?.id

@@ -249,6 +249,60 @@ function paintEditor(canvas: Canvas, player: Player, theme: Theme, box: Box, cur
   }
 }
 
+// The workspace as a file explorer: folders open along the paths Claude has
+// walked, the selection where it last went, and each changed file marked with
+// its counts; files the current turn has not touched recede.
+function paintExplorer(canvas: Canvas, player: Player, theme: Theme, area: Box) {
+  const bg = theme.backgroundLeft
+  const changed = new Map<string, FileEntry>()
+  for (const entry of player.files.values()) if (entry.file) changed.set(entry.file, entry)
+  const rows = player.explorer.rows(new Set(changed.keys()))
+  const selected = rows.findIndex(row => row.path === player.explorer.selected)
+  const offset =
+    selected >= area.h ? Math.min(selected - Math.floor(area.h / 2), rows.length - area.h) : 0
+  const turn = player.turn?.id
+  const maxX = area.x + area.w
+  const hasChanges = (dir: string) => [...changed.keys()].some(path => path.startsWith(dir + '/'))
+
+  for (let r = 0; r < area.h && offset + r < rows.length; r++) {
+    const index = offset + r
+    const row = rows[index]
+    const y = area.y + r
+    const isSelected = index === selected
+    const rowBg = isSelected ? theme.fileTreeCurrentFileBg : bg
+    if (isSelected) canvas.background(area.x, y, area.w, rowBg)
+    const entry = changed.get(row.path)
+    const isPast = entry ? turn !== undefined && entry.turn !== turn : row.kind === 'file'
+    const distance = Math.max(selected < 0 ? 0 : Math.abs(index - selected), isPast ? 12 : 0)
+    const dim = (color: number) => fade(color, rowBg, distance)
+    let x = area.x + row.depth * 2
+    const put = (text: string, color: number) => (x = canvas.text(x, y, text, dim(color), rowBg, maxX))
+
+    switch (row.kind) {
+      case 'root':
+      case 'dir': {
+        put(row.isOpen ? '▾ ' : '▸ ', theme.separator)
+        const color = hasChanges(row.path) ? theme.fileTreeModified : theme.fileTreeDirectory
+        put(row.name + (row.kind === 'dir' ? '/' : ''), row.kind === 'root' ? theme.fileTreeCurrentFileFg : color)
+        break
+      }
+      case 'more':
+        put('  ' + row.name, theme.separator)
+        break
+      case 'file':
+        if (!entry) {
+          put('  ' + row.name, theme.fileTreeDefault)
+          break
+        }
+        put(entry.status + ' ', entry.status === '+' ? theme.fileTreeAdded : theme.fileTreeModified)
+        put(row.name, isSelected ? theme.fileTreeCurrentFileFg : theme.fileTreeDefault)
+        put(` +${entry.added}`, theme.fileTreeStatsAdded)
+        put(` -${entry.deleted}`, theme.fileTreeStatsDeleted)
+        break
+    }
+  }
+}
+
 type TreeRow = { dir: string } | { entry: FileEntry; name: string; indent: boolean }
 
 function treeRows(files: Map<string, FileEntry>): TreeRow[] {
@@ -273,6 +327,7 @@ function paintTree(canvas: Canvas, player: Player, theme: Theme, box: Box) {
   canvas.fill(box.x, box.y, box.w, box.h, bg)
   const area = inner(box)
   if (area.w <= 0 || area.h <= 0) return
+  if (player.explorer.roots.length > 0) return paintExplorer(canvas, player, theme, area)
   const rows = treeRows(player.files)
   // Files the current turn has not touched recede.
   const turn = player.turn?.id
