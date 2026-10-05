@@ -11,6 +11,7 @@ import { Player, type PlayerEvent } from './player'
 import { DEFAULT_THEME, THEMES } from './themes'
 
 const PANE = 'gitlogue'
+const SAVED = { plugin: 'gitlogue', key: 'saved' } as const
 const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit'])
 const FAST_TICK_MS = 33
 const BLINK_MS = 500
@@ -62,18 +63,34 @@ export const register: Register = (on, options) => {
     }
   }
 
-  // The clock that plays the script, set up where the session's engine is in reach.
+  // The clock that plays the script, and the record that outlives a reload of
+  // this module, set up where the session's engine is in reach.
   let schedule = () => {}
+  let persist = () => {}
 
   const enqueue = (event: PlayerEvent) => {
     player.enqueue(event)
     if (!mounted) player.flush()
     schedule()
+    persist()
   }
 
   on('session.start', async ($, e, next) => {
     cwd = e.cwd
     lastTick = Date.now()
+
+    let savedVersion = -1
+    persist = () => {
+      if (player.saveVersion === savedVersion) return
+      savedVersion = player.saveVersion
+      void $.state.set(SAVED, player.save()).catch(() => {})
+    }
+    // A reload of this module (an edit, a changed option) resumes the replay.
+    const { value: saved } = await $.state.get(SAVED)
+    if (saved) {
+      player.restore(saved)
+      savedVersion = player.saveVersion
+    }
 
     const tick = () => {
       const now = Date.now()
@@ -82,9 +99,11 @@ export const register: Register = (on, options) => {
       if (!mounted) {
         player.flush()
         schedule()
+        persist()
         return
       }
       player.advance(dt)
+      persist()
       if (player.turnVersion !== shownTurn) {
         // The turn info is drawn as text; a redraw remounts the rasters too.
         shownTurn = player.turnVersion

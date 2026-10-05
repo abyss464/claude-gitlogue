@@ -3,6 +3,7 @@
 // the way gitlogue scripts a commit, and `advance` plays the script against the
 // clock. Pacing constants are gitlogue's, as multiples of the typing speed.
 
+import type { GitlogueEvent, GitlogueFileEntry, GitlogueSaved, GitlogueTurn, GitlogueView } from '../types'
 import { countChanges, diffLines, type Hunk } from './diff'
 import { Highlighter } from './highlight'
 
@@ -29,16 +30,9 @@ const PUSH_OUTPUT_PAUSE = 10.0
 const MAX_TERMINAL_LINES = 300
 const TAB_WIDTH = 4
 
-export type TurnInfo = { id: string; date: string; prompt: string }
-
-export type FileEntry = { path: string; status: '+' | '~'; added: number; deleted: number }
-
-export type PlayerEvent =
-  | { type: 'turn'; turn: TurnInfo }
-  | { type: 'edit'; path: string; before: string; after: string; created: boolean }
-  | { type: 'command'; command: string }
-  | { type: 'output'; lines: string[]; failed: boolean }
-  | { type: 'done'; durationMs: number; aborted: boolean }
+export type TurnInfo = GitlogueTurn
+export type FileEntry = GitlogueFileEntry
+export type PlayerEvent = GitlogueEvent
 
 type FileChange = { path: string; oldLines: string[]; entry: FileEntry }
 
@@ -141,6 +135,14 @@ export class Player {
   private isBlank = false
   private steps: Step[] = []
   private next = 0
+  // Absolute index of steps[0], so event boundaries survive compaction.
+  private base = 0
+  // Events not yet fully played, each with the absolute step index it ends at,
+  // and the panes as they stood when the oldest of them began.
+  private segments: { event: PlayerEvent; end: number }[] = []
+  private checkpoint: GitlogueView = this.view()
+  // Bumped whenever what `save` returns changes.
+  saveVersion = 0
   private wait = 0
   private remaining = 0
   private filesThisTurn = 0
@@ -161,6 +163,76 @@ export class Player {
   }
 
   enqueue(event: PlayerEvent) {
+    this.script(event)
+    this.segments.push({ event, end: this.base + this.steps.length })
+    this.saveVersion++
+    this.settle()
+  }
+
+  // The replay as it stands: the panes at the oldest unfinished event, and the
+  // events from there on, to pick up after a reload.
+  save(): GitlogueSaved {
+    return { view: this.checkpoint, pending: this.segments.map(segment => segment.event) }
+  }
+
+  restore(saved: GitlogueSaved) {
+    const view = saved.view
+    this.lines = view.lines.length > 0 ? view.lines.slice() : ['']
+    this.cursorLine = view.cursorLine
+    this.cursorCol = view.cursorCol
+    this.active = view.active
+    this.hasFile = view.hasFile
+    this.isBlank = view.isBlank
+    this.terminal = view.terminal.slice()
+    this.turn = view.turn ?? undefined
+    this.files = new Map(view.files.map(entry => [entry.path, { ...entry }]))
+    this.currentPath = view.currentPath ?? undefined
+    this.dialog = undefined
+    if (view.hasFile && view.currentPath) this.highlighter.setPath(view.currentPath)
+    this.turnVersion++
+    this.steps = []
+    this.next = 0
+    this.base = 0
+    this.wait = 0
+    this.remaining = 0
+    this.segments = []
+    this.filesThisTurn = view.files.length
+    this.scriptedPath = view.hasFile ? (view.currentPath ?? undefined) : undefined
+    this.scriptedText = view.lines.join('\n')
+    this.checkpoint = this.view()
+    this.saveVersion++
+    for (const event of saved.pending) this.enqueue(event)
+  }
+
+  private view(): GitlogueView {
+    return {
+      lines: this.lines.slice(),
+      cursorLine: this.cursorLine,
+      cursorCol: this.cursorCol,
+      active: this.active,
+      hasFile: this.hasFile,
+      isBlank: this.isBlank,
+      terminal: this.terminal.slice(),
+      turn: this.turn ?? null,
+      files: [...this.files.values()].map(entry => ({ ...entry })),
+      currentPath: this.currentPath ?? null,
+    }
+  }
+
+  // Retires the events whose steps have all run.
+  private settle() {
+    let moved = false
+    while (this.segments.length > 0 && this.segments[0].end <= this.base + this.next) {
+      this.segments.shift()
+      moved = true
+    }
+    if (moved) {
+      this.checkpoint = this.view()
+      this.saveVersion++
+    }
+  }
+
+  private script(event: PlayerEvent) {
     const before = this.steps.length
     switch (event.type) {
       case 'turn':
@@ -211,13 +283,16 @@ export class Player {
       this.remaining = Math.max(0, this.remaining - step.dur)
       changed = true
       executed++
+      if (this.segments.length > 0 && this.segments[0].end <= this.base + this.next) this.settle()
     }
     if (this.isIdle) {
+      this.base += this.steps.length
       this.steps = []
       this.next = 0
       this.wait = 0
       this.remaining = 0
     } else if (this.next > 4096) {
+      this.base += this.next
       this.steps = this.steps.slice(this.next)
       this.next = 0
     }
