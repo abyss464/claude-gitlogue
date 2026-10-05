@@ -7,7 +7,7 @@ import type { Register } from 'claude-code'
 
 import type { GitlogueLink, GitloguePlace, GitlogueSaved } from '../types'
 
-import { candidatePaths, downloadTargets, reverseApply, type EngineHunk } from './bashfiles'
+import { candidatePaths, commitMessageOf, downloadTargets, hitsOf, reverseApply, searchOf, type EngineHunk } from './bashfiles'
 import { chainTo, parentOf, type DirEntry } from './explorer'
 import { Chat, drawPhone, registerChat } from './chat'
 import { imageBox, layoutFor, paint, type Layout } from './frame'
@@ -220,7 +220,7 @@ export const register: Register = (on, options) => {
     }
 
     schedule = () => {
-      const wanted = mounted ? (player.isIdle ? BLINK_MS : FAST_TICK_MS) : 0
+      const wanted = mounted ? (player.isIdle ? (player.hasRunning ? 100 : BLINK_MS) : FAST_TICK_MS) : 0
       if (wanted === timerMs) return
       timer?.cancel()
       timer = undefined
@@ -347,8 +347,8 @@ export const register: Register = (on, options) => {
     if (e.tool === 'Bash') {
       const command = String((e as { command?: unknown }).command ?? '')
       const description = (e as { description?: unknown }).description
-      enqueue({ type: 'command', command, description: typeof description === 'string' ? description : undefined })
       const startedAt = Date.now()
+      enqueue({ type: 'command', command, description: typeof description === 'string' ? description : undefined, startedAt })
 
       // The text of a file now: a string, null when it does not exist, or
       // undefined when it is no text file to replay (a folder, binary, huge).
@@ -367,8 +367,12 @@ export const register: Register = (on, options) => {
       const fetched = downloadTargets(command, shellCwd, home)
       const paths = candidatePaths(command, shellCwd, home).filter(path => !isOwn(path) && !fetched.includes(path))
       const before = new Map<string, string | null>()
+      // What existed before, of any kind, to see what the command removes.
+      const existed = new Map<string, 'file' | 'dir' | 'other'>()
       await Promise.all(
         paths.map(async path => {
+          const stat = await $.fs.stat(path).catch(() => undefined)
+          if (stat) existed.set(path, stat.kind)
           const text = await look(path).catch(() => undefined)
           if (text !== undefined) before.set(path, text)
         }),
@@ -407,7 +411,46 @@ export const register: Register = (on, options) => {
         const old = file.created ? '' : reverseApply(now, file.hunks)
         if (old !== now) edits.push(await editOf(file.filePath, old, now, file.created === true))
       }
+      // What the command removed, outermost only: a folder's files go with it.
+      const gone: string[] = []
+      for (const [path, kind] of existed)
+        if (!(await $.fs.exists(path).catch(() => true))) gone.push(path + (kind === 'dir' ? '/' : ''))
+      for (const path of gone.sort()) {
+        const file = path.replace(/\/$/, '')
+        if (gone.some(other => other !== path && other.endsWith('/') && file.startsWith(other))) continue
+        edits.push({ type: 'delete', path: display(file), file, isDir: path.endsWith('/'), place: await placeOf(file).catch(() => undefined) })
+      }
       edits.forEach(enqueue)
+
+      // A search through code or for file names, as the editor would run it.
+      const search = searchOf(command, shellCwd, home)
+      const output = ran.deny ?? ran.text ?? ''
+      if (search?.kind === 'code') {
+        const only = search.paths.length === 1 ? display(search.paths[0]) : undefined
+        const { hits, total } = hitsOf(output, only)
+        enqueue({ type: 'codesearch', query: search.query, hits: hits.map(hit => ({ ...hit, path: display(hit.path) })), total })
+      } else if (search?.kind === 'files') {
+        const files = output.split('\n').map(line => line.trim()).filter(line => line && !/^Exit code/.test(line))
+        enqueue({ type: 'findfiles', pattern: search.pattern, files: files.map(display) })
+      }
+
+      // A commit or push, as git reports it.
+      const git = ('result' in ran ? (ran.result as { gitOperation?: { commit?: { sha: string; branch?: string }; push?: { branch: string } } } | undefined) : undefined)?.gitOperation
+      if (git?.commit || git?.push) {
+        let root: string | undefined
+        for (let dir = shellCwd; dir && dir !== '/'; dir = parentOf(dir))
+          if (await $.fs.exists(dir + '/.git').catch(() => false)) {
+            root = dir
+            break
+          }
+        enqueue({
+          type: 'git',
+          commit: git.commit ? { ...git.commit, message: commitMessageOf(command, output) } : undefined,
+          push: git.push,
+          root,
+          durationMs,
+        })
+      }
 
       const text = ran.deny ?? ran.text ?? ''
       const exit = /^Exit code (\d+)/m.exec(text)
@@ -455,7 +498,22 @@ export const register: Register = (on, options) => {
 
     if (e.tool === 'Read') {
       const ran = await next(e)
-      const result = 'result' in ran ? (ran.result as { type?: string; file?: { dimensions?: Record<string, number | undefined> } } | undefined) : undefined
+      const result = 'result' in ran ? (ran.result as { type?: string; file?: { dimensions?: Record<string, number | undefined>; startLine?: number; numLines?: number; content?: string } } | undefined) : undefined
+      if (result?.type === 'text') {
+        const file = String((e as { file_path?: unknown }).file_path ?? '')
+        const whole = await $.fs.read(file).catch(() => undefined)
+        if (typeof whole === 'string' && !whole.includes('\u0000'))
+          enqueue({
+            type: 'read',
+            path: display(file),
+            file,
+            text: whole,
+            startLine: result.file?.startLine ?? 1,
+            numLines: result.file?.numLines ?? whole.split('\n').length,
+            place: await placeOf(file).catch(() => undefined),
+          })
+        return ran
+      }
       if (result?.type !== 'image') return ran
       const file = String((e as { file_path?: unknown }).file_path ?? '')
       // The terminal shows PNGs; anything else is shown through a PNG copy.

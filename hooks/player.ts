@@ -6,7 +6,10 @@
 import type {
   GitlogueBrowser,
   GitlogueEvent,
+  GitlogueFlight,
   GitlogueImage,
+  GitloguePalette,
+  GitlogueSearch,
   GitlogueFileEntry,
   GitloguePlace,
   GitlogueSaved,
@@ -15,7 +18,7 @@ import type {
   GitlogueView,
 } from '../types'
 import { countChanges, diffLines, type Hunk } from './diff'
-import { chainTo, Explorer, nameOf, type DirEntry } from './explorer'
+import { chainTo, Explorer, nameOf, parentOf, type DirEntry } from './explorer'
 import { Highlighter } from './highlight'
 
 const CURSOR_MOVE_PAUSE = 0.5
@@ -42,6 +45,8 @@ const MAX_TERMINAL_LINES = 300
 const EXPAND_PAUSE = 6.0
 const SELECT_STEP_PAUSE = 1.5
 const PAGE_LOAD_STEPS = 18
+const MAX_READ_SWEEP = 120
+const FLY_STEPS = 16
 const DOWNLOAD_STEPS = 28
 
 type Screen = 'code' | 'browser' | 'image'
@@ -77,6 +82,7 @@ type FileChange = { path: string; oldLines: string[]; entry: FileEntry }
 
 type StepBody =
   | { k: 'char'; line: number; col: number; ch: string }
+  | { k: 'backspace'; line: number; col: number }
   | { k: 'insertLine'; line: number; text: string }
   | { k: 'deleteLine'; line: number }
   | { k: 'move'; line: number; col: number }
@@ -93,6 +99,17 @@ type StepBody =
   | { k: 'addressChar'; ch: string }
   | { k: 'image'; image: GitlogueImage }
   | { k: 'progress'; fraction: number; right?: string }
+  | { k: 'mark'; from: number; line: number; col: number }
+  | { k: 'sidebar'; sidebar: 'explorer' | 'search' }
+  | { k: 'search'; set: Partial<GitlogueSearch> }
+  | { k: 'searchChar'; ch: string }
+  | { k: 'palette'; set: Partial<GitloguePalette> | null }
+  | { k: 'paletteChar'; ch: string }
+  | { k: 'termRunning' }
+  | { k: 'commitMark'; root: string }
+  | { k: 'flyStart'; file: string }
+  | { k: 'fly'; t: number }
+  | { k: 'trash'; file: string }
   | { k: 'dialogOpen' }
   | { k: 'dialogChar'; ch: string }
   | { k: 'termLine'; line: TermLine }
@@ -189,6 +206,15 @@ export class Player {
   screen: Screen = 'code'
   browser: GitlogueBrowser = { ...EMPTY_BROWSER }
   image: GitlogueImage | undefined
+  // Lines read with the highlighter, the sidebar's view, the quick-open
+  // palette, a file on its way to the trash, and how many went there.
+  marks: { from: number; line: number; col: number } | undefined
+  sidebar: 'explorer' | 'search' = 'explorer'
+  search: GitlogueSearch | undefined
+  palette: GitloguePalette | undefined
+  flight: GitlogueFlight | undefined
+  trashed = 0
+  private planSidebar: 'explorer' | 'search' = 'explorer'
   // Bumped when the screen or its picture changes, for the drawing that holds it.
   sceneVersion = 0
   private planScreen: Screen = 'code'
@@ -220,6 +246,11 @@ export class Player {
   constructor(speedMs: number, maxLagMs: number) {
     this.speedMs = speedMs
     this.maxLagMs = maxLagMs
+  }
+
+  // A command still running at the bottom of the terminal.
+  get hasRunning(): boolean {
+    return this.terminal.some(line => line.kind === 'command' && line.running === true)
   }
 
   get isIdle(): boolean {
@@ -258,6 +289,13 @@ export class Player {
     this.screen = view.screen ?? 'code'
     this.browser = view.browser ? { ...view.browser, results: view.browser.results.slice(), body: view.browser.body.slice() } : { ...EMPTY_BROWSER }
     this.image = view.image ? { ...view.image } : undefined
+    this.marks = view.marks ? { ...view.marks } : undefined
+    this.sidebar = view.sidebar ?? 'explorer'
+    this.planSidebar = this.sidebar
+    this.search = view.search ? { ...view.search, hits: view.search.hits.slice() } : undefined
+    this.palette = undefined
+    this.flight = undefined
+    this.trashed = view.trashed ?? 0
     this.planScreen = this.screen
     this.planBrowser = { ...this.browser }
     this.sceneVersion++
@@ -327,6 +365,10 @@ export class Player {
       screen: this.screen,
       browser: { ...this.browser, results: this.browser.results.slice(), body: this.browser.body.slice() },
       image: this.image ? { ...this.image } : undefined,
+      marks: this.marks ? { ...this.marks } : undefined,
+      sidebar: this.sidebar,
+      search: this.search ? { ...this.search, hits: this.search.hits.slice() } : undefined,
+      trashed: this.trashed,
     }
   }
 
@@ -358,8 +400,9 @@ export class Player {
           this.push({ k: 'termLine', line: { kind: 'intent', text: event.description.trim() } })
           this.pause(OPEN_CMD_PAUSE)
         }
-        this.push({ k: 'termLine', line: { kind: 'command', text: '' } })
+        this.push({ k: 'termLine', line: { kind: 'command', text: '', startedAt: event.startedAt } })
         for (const ch of cellText(event.command.replace(/\s*\n\s*/g, ' ; ')).slice(0, 240)) this.push({ k: 'termChar', ch }, this.typing())
+        this.push({ k: 'termRunning' }, 0)
         this.pause(GIT_ADD_CMD_PAUSE)
         break
       case 'output': {
@@ -382,6 +425,21 @@ export class Player {
         break
       case 'download':
         this.scriptDownload(event)
+        break
+      case 'read':
+        this.scriptRead(event)
+        break
+      case 'codesearch':
+        this.scriptCodeSearch(event)
+        break
+      case 'findfiles':
+        this.scriptFindFiles(event)
+        break
+      case 'git':
+        this.scriptGit(event)
+        break
+      case 'delete':
+        this.scriptDelete(event)
         break
       case 'done':
         this.pause(PUSH_OUTPUT_PAUSE)
@@ -514,6 +572,11 @@ export class Player {
   // selection is, opening each closed folder on the way, then onto the file.
   private scriptNavigate(file: string, place: GitloguePlace) {
     const plan = this.plan
+    if (this.planSidebar !== 'explorer') {
+      this.push({ k: 'sidebar', sidebar: 'explorer' }, 0)
+      this.planSidebar = 'explorer'
+      this.pause(OPEN_CMD_PAUSE)
+    }
     if (!plan.roots.includes(place.root)) {
       this.push({ k: 'root', root: place.root })
       plan.addRoot(place.root)
@@ -672,6 +735,120 @@ export class Player {
     this.pause(GIT_ADD_CMD_PAUSE)
   }
 
+  // Code read with a highlighter: the file opened if it is not already, the
+  // cursor brought to what was read, and the pen drawn along each line of it.
+  private scriptRead(event: Extract<PlayerEvent, { type: 'read' }>) {
+    const lines = splitLines(event.text)
+    if (lines.length === 0) return
+    const isOpen = this.planScreen === 'code' && this.scriptedPath === event.path && this.scriptedText === lines.join('\n')
+    this.planScreen = 'code'
+    if (!isOpen) {
+      this.pause(this.filesThisTurn === 0 ? OPEN_FILE_FIRST_PAUSE : OPEN_FILE_PAUSE)
+      if (event.place) this.scriptNavigate(event.file, event.place)
+      const entry: FileEntry = { path: event.path, status: '~', added: 0, deleted: 0, file: event.file }
+      this.push({ k: 'switchFile', change: { path: event.path, oldLines: lines, entry } })
+      this.pause(FILE_SWITCH_PAUSE)
+      this.scriptedPath = event.path
+      this.scriptedText = lines.join('\n')
+    }
+    const from = Math.min(lines.length - 1, Math.max(0, event.startLine - 1))
+    const to = Math.min(lines.length, from + Math.max(1, event.numLines))
+    this.scriptCursorMove(0, from, lines)
+    this.pause(OPEN_CMD_PAUSE)
+    const swept = Math.min(to - from, MAX_READ_SWEEP)
+    for (let line = from; line < from + swept; line++) {
+      const length = lines[line].length
+      for (const share of [0.34, 0.67, 1])
+        this.push({ k: 'mark', from, line, col: Math.round(length * share) }, this.speedMs * (length > 0 ? 1.4 : 0.3))
+      if ((line - from) % 6 === 5) this.pause(4)
+    }
+    if (to - from > swept) this.push({ k: 'mark', from, line: to - 1, col: lines[to - 1].length })
+    this.pause(HUNK_PAUSE)
+  }
+
+  // A search through code, as the editor's search view runs one: the query
+  // typed into its box, then the matching files listed one by one, each with
+  // its lines.
+  private scriptCodeSearch(event: Extract<PlayerEvent, { type: 'codesearch' }>) {
+    this.push({ k: 'sidebar', sidebar: 'search' }, 0)
+    this.planSidebar = 'search'
+    this.push({ k: 'search', set: { query: '', hits: [], shown: 0, total: event.total } })
+    this.pause(OPEN_CMD_PAUSE)
+    for (const ch of cellText(event.query).slice(0, 80)) this.push({ k: 'searchChar', ch }, this.typing())
+    this.pause(OPEN_CMD_PAUSE)
+    const hits = event.hits.slice(0, 30).map(hit => ({
+      path: cellText(hit.path),
+      matches: hit.matches.slice(0, 6).map(match => ({ line: match.line, text: cellText(match.text) })),
+    }))
+    this.push({ k: 'search', set: { hits } }, 0)
+    for (let i = 1; i <= hits.length; i++) this.push({ k: 'search', set: { shown: i } }, this.speedMs * 3)
+    this.pause(HUNK_PAUSE)
+  }
+
+  // Files found by name, as quick open finds them: the pattern typed into the
+  // palette, the matches listed, and the palette put away.
+  private scriptFindFiles(event: Extract<PlayerEvent, { type: 'findfiles' }>) {
+    this.push({ k: 'palette', set: { text: '', items: [], shown: 0 } }, this.speedMs * 4)
+    for (const ch of cellText(event.pattern).slice(0, 60)) this.push({ k: 'paletteChar', ch }, this.typing())
+    this.pause(OPEN_CMD_PAUSE)
+    const items = event.files.slice(0, 10).map(cellText)
+    this.push({ k: 'palette', set: { items } }, 0)
+    for (let i = 1; i <= items.length; i++) this.push({ k: 'palette', set: { shown: i } }, this.speedMs * 2)
+    this.pause(HUNK_PAUSE)
+    this.push({ k: 'palette', set: null })
+  }
+
+  // A commit lands in the terminal with its id and branch and the files it
+  // took settle in the explorer; a push goes up with a bar, as a download comes down.
+  private scriptGit(event: Extract<PlayerEvent, { type: 'git' }>) {
+    if (event.commit) {
+      this.push({
+        k: 'termLine',
+        line: { kind: 'commit', text: cellText(event.commit.message ?? ''), sha: event.commit.sha.slice(0, 7), branch: event.commit.branch },
+      })
+      if (event.root) this.push({ k: 'commitMark', root: event.root })
+      this.pause(GIT_ADD_CMD_PAUSE)
+    }
+    if (event.push) {
+      this.push({ k: 'termLine', line: { kind: 'progress', up: true, text: `origin/${event.push.branch}`, fraction: 0, right: 'pushing' } })
+      const span = Math.min(4000, Math.max(800, event.durationMs))
+      let fraction = 0
+      for (let i = 1; i <= DOWNLOAD_STEPS; i++) {
+        fraction = i === DOWNLOAD_STEPS ? 1 : Math.min(0.97, fraction + (Math.random() * 2) / DOWNLOAD_STEPS)
+        this.push({ k: 'progress', fraction, right: `${Math.round(fraction * 100)}%` }, (span / DOWNLOAD_STEPS) * (0.4 + Math.random() * 1.2))
+      }
+      this.push({ k: 'progress', fraction: 1, right: `pushed · ${formatDuration(event.durationMs, true)}` })
+      this.pause(GIT_ADD_CMD_PAUSE)
+    }
+  }
+
+  // A file thrown away: the explorer walks to it, and it flies into the trash.
+  private scriptDelete(event: Extract<PlayerEvent, { type: 'delete' }>) {
+    this.pause(OPEN_FILE_PAUSE)
+    if (event.place) {
+      const folder = parentOf(event.file)
+      const entries = event.place.listings[folder]
+      if (entries)
+        event = {
+          ...event,
+          place: {
+            ...event.place,
+            listings: { ...event.place.listings, [folder]: [...entries, { name: nameOf(event.file), dir: event.isDir }] },
+          },
+        }
+      this.scriptNavigate(event.file, event.place!)
+    }
+    this.pause(OPEN_CMD_PAUSE)
+    this.push({ k: 'flyStart', file: event.file }, 0)
+    for (let i = 1; i <= FLY_STEPS; i++) this.push({ k: 'fly', t: i / FLY_STEPS }, this.speedMs * 1.5)
+    this.push({ k: 'trash', file: event.file })
+    this.plan.unlist(parentOf(event.file), nameOf(event.file))
+    this.planKeep.delete(event.file)
+    if (this.scriptedPath === event.path) this.scriptedPath = undefined
+    this.push({ k: 'termLine', line: { kind: 'trash', text: cellText(event.path) + (event.isDir ? '/' : '') } })
+    this.pause(GIT_ADD_CMD_PAUSE)
+  }
+
   private scriptHunks(oldLines: string[], hunks: Hunk[]) {
     // The buffer as the script leaves it, for where the cursor lands.
     const buffer = oldLines.slice()
@@ -681,34 +858,87 @@ export class Player {
       const target = Math.max(0, hunk.oldStart - 1 + offset)
       cursor = this.scriptCursorMove(cursor, target, buffer)
       let line = target
-      for (const change of hunk.lines) {
-        if (change.kind === 'del') {
-          this.push({ k: 'deleteLine', line })
-          this.pause(DELETE_LINE_PAUSE)
-          buffer.splice(line, 1)
-          cursor = line
-          offset--
-        } else if (change.kind === 'add') {
-          const indent = indentOf(change.text)
-          this.push({ k: 'insertLine', line, text: change.text.slice(0, indent) })
-          for (let col = indent; col < change.text.length; col++)
-            this.push({ k: 'char', line, col, ch: change.text[col] }, this.typing())
-          buffer.splice(line, 0, change.text)
-          cursor = line
-          line++
-          offset++
-          this.pause(INSERT_LINE_PAUSE)
-        } else {
+      let i = 0
+      while (i < hunk.lines.length) {
+        const change = hunk.lines[i]
+        if (change.kind === 'ctx') {
           if (line !== cursor) {
             this.push({ k: 'move', line, col: indentOf(change.text) })
             this.pause(CURSOR_MOVE_PAUSE)
           }
           cursor = line
           line++
+          i++
+          continue
+        }
+        // A run of removed lines and the added lines that replace them.
+        const dels: string[] = []
+        const adds: string[] = []
+        while (i < hunk.lines.length && hunk.lines[i].kind === 'del') dels.push(hunk.lines[i++].text)
+        while (i < hunk.lines.length && hunk.lines[i].kind === 'add') adds.push(hunk.lines[i++].text)
+        // Line for line, a changed line is edited where it stands when most of
+        // it survives; otherwise it goes and its replacement is typed.
+        const pairs = Math.min(dels.length, adds.length)
+        for (let k = 0; k < pairs; k++) {
+          if (isSimilar(dels[k], adds[k])) this.scriptLineEdit(line, dels[k], adds[k])
+          else {
+            this.scriptDeleteLine(line)
+            this.scriptInsertLine(line, adds[k])
+          }
+          buffer[line] = adds[k]
+          cursor = line
+          line++
+        }
+        for (let k = pairs; k < dels.length; k++) {
+          this.scriptDeleteLine(line)
+          buffer.splice(line, 1)
+          cursor = line
+          offset--
+        }
+        for (let k = pairs; k < adds.length; k++) {
+          this.scriptInsertLine(line, adds[k])
+          buffer.splice(line, 0, adds[k])
+          cursor = line
+          line++
+          offset++
         }
       }
       this.pause(HUNK_PAUSE)
     }
+  }
+
+  private scriptDeleteLine(line: number) {
+    this.push({ k: 'deleteLine', line })
+    this.pause(DELETE_LINE_PAUSE)
+  }
+
+  private scriptInsertLine(line: number, text: string) {
+    const indent = indentOf(text)
+    this.push({ k: 'insertLine', line, text: text.slice(0, indent) })
+    for (let col = indent; col < text.length; col++) this.push({ k: 'char', line, col, ch: text[col] }, this.typing())
+    this.pause(INSERT_LINE_PAUSE)
+  }
+
+  // A line changed in place, as a person edits one: the cursor goes to the end
+  // of what differs, backspaces over it, and types what replaces it.
+  private scriptLineEdit(line: number, before: string, after: string) {
+    let head = 0
+    while (head < before.length && head < after.length && before[head] === after[head]) head++
+    let tail = 0
+    while (
+      tail < before.length - head &&
+      tail < after.length - head &&
+      before[before.length - 1 - tail] === after[after.length - 1 - tail]
+    )
+      tail++
+    const removed = before.length - head - tail
+    this.push({ k: 'move', line, col: head + removed })
+    this.pause(OPEN_CMD_PAUSE)
+    for (let n = 0; n < removed; n++) this.push({ k: 'backspace', line, col: head + removed - n }, this.typing(0.6))
+    if (removed > 0) this.pause(CURSOR_MOVE_PAUSE * 4)
+    const typed = after.slice(head, after.length - tail)
+    for (let n = 0; n < typed.length; n++) this.push({ k: 'char', line, col: head + n, ch: typed[n] }, this.typing())
+    this.pause(INSERT_LINE_PAUSE)
   }
 
   private scriptCursorMove(from: number, to: number, buffer: string[]): number {
@@ -743,10 +973,75 @@ export class Player {
     switch (step.k) {
       case 'char': {
         this.active = 'editor'
+        this.marks = undefined
         const text = this.lines[step.line] ?? ''
         this.lines[step.line] = text.slice(0, step.col) + step.ch + text.slice(step.col)
         this.cursorLine = step.line
         this.cursorCol = step.col + 1
+        this.highlighter.invalidate(step.line)
+        break
+      }
+      case 'mark':
+        this.active = 'editor'
+        this.marks = { from: step.from, line: step.line, col: step.col }
+        this.cursorLine = Math.min(step.line, this.lines.length - 1)
+        this.cursorCol = step.col
+        break
+      case 'sidebar':
+        this.sidebar = step.sidebar
+        break
+      case 'search':
+        this.active = 'explorer'
+        this.search = { query: '', hits: [], shown: 0, total: 0, ...this.search, ...step.set }
+        break
+      case 'searchChar':
+        this.active = 'explorer'
+        this.search = { query: '', hits: [], shown: 0, total: 0, ...this.search }
+        this.search.query += step.ch
+        break
+      case 'palette':
+        this.active = 'explorer'
+        this.palette = step.set === null ? undefined : { text: '', items: [], shown: 0, ...this.palette, ...step.set }
+        break
+      case 'paletteChar':
+        if (this.palette) this.palette = { ...this.palette, text: this.palette.text + step.ch }
+        break
+      case 'termRunning': {
+        const last = this.terminal[this.terminal.length - 1]
+        if (last?.kind === 'command' && last.right === undefined) last.running = true
+        break
+      }
+      case 'commitMark':
+        for (const entry of this.files.values()) if (entry.file?.startsWith(step.root + '/')) entry.committed = true
+        break
+      case 'flyStart': {
+        const keep = new Set([...this.files.values()].flatMap(entry => (entry.file ? [entry.file] : [])))
+        const rows = this.explorer.rows(keep)
+        const row = rows.findIndex(r => r.path === step.file)
+        this.flight = { name: nameOf(step.file), row: Math.max(0, row), depth: rows[row]?.depth ?? 1, t: 0 }
+        break
+      }
+      case 'fly':
+        if (this.flight) this.flight = { ...this.flight, t: step.t }
+        break
+      case 'trash': {
+        this.explorer.unlist(parentOf(step.file), nameOf(step.file))
+        for (const [path, entry] of [...this.files])
+          if (entry.file === step.file || entry.file?.startsWith(step.file + '/')) this.files.delete(path)
+        if (this.hasFile && this.currentPath && step.file.endsWith('/' + this.currentPath.replace(/^\//, ''))) {
+          this.hasFile = false
+          this.lines = ['']
+        }
+        this.flight = undefined
+        this.trashed++
+        break
+      }
+      case 'backspace': {
+        this.active = 'editor'
+        const text = this.lines[step.line] ?? ''
+        this.lines[step.line] = text.slice(0, step.col - 1) + text.slice(step.col)
+        this.cursorLine = step.line
+        this.cursorCol = step.col - 1
         this.highlighter.invalidate(step.line)
         break
       }
@@ -761,6 +1056,7 @@ export class Player {
         break
       case 'deleteLine':
         this.active = 'editor'
+        this.marks = undefined
         this.lines.splice(step.line, 1)
         if (this.lines.length === 0) this.lines.push('')
         this.cursorLine = Math.min(step.line, this.lines.length - 1)
@@ -775,6 +1071,7 @@ export class Player {
       case 'pause':
         break
       case 'switchFile': {
+        this.marks = undefined
         this.setScreen('code')
         this.active = 'editor'
         this.dialog = undefined
@@ -868,6 +1165,7 @@ export class Player {
           if (line.kind === 'command' && line.right === undefined) {
             line.right = step.right
             line.ok = step.ok
+            line.running = false
             break
           }
         }
@@ -906,6 +1204,17 @@ function untypeable(path: string, hunks: Hunk[]): string | undefined {
       if (line.kind === 'add') typed += line.text.length
     }
   return typed > MAX_TYPED_CHARS ? 'too large' : undefined
+}
+
+// Whether a changed line is mostly the line it replaces: what both start and
+// end with covers at least half of the longer one.
+function isSimilar(a: string, b: string): boolean {
+  if (!a.trim() || !b.trim()) return false
+  let head = 0
+  while (head < a.length && head < b.length && a[head] === b[head]) head++
+  let tail = 0
+  while (tail < a.length - head && tail < b.length - head && a[a.length - 1 - tail] === b[b.length - 1 - tail]) tail++
+  return (head + tail) * 2 >= Math.max(a.length, b.length)
 }
 
 // Whether two addresses name the same page, ignoring scheme and trailing slash.

@@ -14,9 +14,25 @@ export type GitlogueFileEntry = {
   file?: string
   // Shown in place of line counts, as a download's size.
   note?: string
+  // Committed since it changed: drawn settled, without the change mark.
+  committed?: boolean
 }
 
 export type GitlogueLink = { title: string; url: string }
+
+// One file's matches in a code search, each a line number and its text.
+export type GitlogueHit = { path: string; matches: { line: number; text: string }[] }
+
+// The sidebar's search view: the query typed so far, the files whose matches
+// have come in, and how many of them show.
+export type GitlogueSearch = { query: string; hits: GitlogueHit[]; shown: number; total: number }
+
+// The quick-open palette: the pattern typed and the files it lists.
+export type GitloguePalette = { text: string; items: string[]; shown: number }
+
+// A file on its way to the trash: its row's name, where it started, how far
+// along it is (0 to 1).
+export type GitlogueFlight = { name: string; row: number; depth: number; t: number }
 
 // The editor's area as a browser: the address, what the page is (a search
 // home, a results page, a fetched page), what has been typed into its box,
@@ -59,27 +75,39 @@ export type GitlogueExplorer = {
 export type GitlogueEvent =
   | { type: 'turn'; turn: GitlogueTurn }
   | { type: 'edit'; path: string; before: string; after: string; created: boolean; file?: string; place?: GitloguePlace }
-  | { type: 'command'; command: string; description?: string }
+  | { type: 'command'; command: string; description?: string; startedAt?: number }
   | { type: 'output'; lines: string[]; total: number; failed: boolean; exitCode?: number; durationMs: number }
   | { type: 'done'; durationMs: number; aborted: boolean }
   | { type: 'search'; query: string; results: GitlogueLink[]; durationMs: number }
   | { type: 'fetch'; url: string; text: string; durationMs: number }
   | { type: 'image'; path: string; file: string; png: string; width: number; height: number; place?: GitloguePlace }
   | { type: 'download'; path: string; file: string; bytes: number; durationMs: number; place?: GitloguePlace }
+  | { type: 'read'; path: string; file: string; text: string; startLine: number; numLines: number; place?: GitloguePlace }
+  | { type: 'codesearch'; query: string; hits: GitlogueHit[]; total: number }
+  | { type: 'findfiles'; pattern: string; files: string[] }
+  | { type: 'git'; commit?: { sha: string; branch?: string; message?: string }; push?: { branch: string }; root?: string; durationMs: number }
+  | { type: 'delete'; path: string; file: string; isDir: boolean; place?: GitloguePlace }
 
 // One row of the terminal pane, as Claude meets a shell: the turn it belongs
 // to, what a command is for, the command, what came back, the files it wrote,
 // and how the turn ended.
 export type GitlogueTermLine = {
-  kind: 'rule' | 'intent' | 'command' | 'output' | 'more' | 'edit' | 'done' | 'fail' | 'prompt' | 'progress'
+  kind: 'rule' | 'intent' | 'command' | 'output' | 'more' | 'edit' | 'done' | 'fail' | 'prompt' | 'progress' | 'commit' | 'trash'
   text: string
   // Drawn flush right: a command's time and status, an edit's line counts.
   right?: string
   ok?: boolean
   // The first line of a result, drawn under the ⎿ mark.
   first?: boolean
-  // How far a download has come, 0 to 1.
+  // How far a download (or, with `up`, a push) has come, 0 to 1.
   fraction?: number
+  up?: boolean
+  // A command still running: when it started, in epoch milliseconds.
+  startedAt?: number
+  running?: boolean
+  // A commit's id and branch.
+  sha?: string
+  branch?: string
 }
 
 // The panes as they stood when the oldest unfinished event began.
@@ -98,6 +126,14 @@ export type GitlogueView = {
   screen?: 'code' | 'browser' | 'image'
   browser?: GitlogueBrowser
   image?: GitlogueImage
+  // Lines read with the highlighter: whole lines from `from` up to `line`,
+  // and `line` itself up to `col`.
+  marks?: { from: number; line: number; col: number }
+  sidebar?: 'explorer' | 'search'
+  search?: GitlogueSearch
+  palette?: GitloguePalette
+  flight?: GitlogueFlight
+  trashed?: number
 }
 
 // `session` names the session the replay belongs to, where it is recorded.

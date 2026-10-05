@@ -61,16 +61,24 @@ export class Explorer {
     if (!this.roots.includes(root)) this.roots.push(root)
   }
 
-  // A folder's listing, keeping every name it had and adding `ensure` when
-  // the folder was listed before that file existed.
+  // A folder's listing as it is now, adding `ensure` when the folder was
+  // listed before that file existed (or after it was removed).
   list(dir: string, entries: DirEntry[], ensure?: DirEntry) {
-    const byName = new Map((this.listings.get(dir) ?? []).map(entry => [entry.name, entry]))
-    for (const entry of entries) byName.set(entry.name, entry)
+    const byName = new Map(entries.map(entry => [entry.name, entry]))
     if (ensure && !byName.has(ensure.name)) byName.set(ensure.name, ensure)
     const sorted = [...byName.values()].sort((a, b) =>
       a.dir !== b.dir ? (a.dir ? -1 : 1) : a.name.toLowerCase() < b.name.toLowerCase() ? -1 : a.name.toLowerCase() > b.name.toLowerCase() ? 1 : 0,
     )
     this.listings.set(dir, sorted)
+  }
+
+  // A name gone from a folder's listing, and the folder closed if it was one.
+  unlist(dir: string, name: string) {
+    const entries = this.listings.get(dir)
+    if (entries) this.listings.set(dir, entries.filter(entry => entry.name !== name))
+    const path = (dir === '/' ? '' : dir) + '/' + name
+    for (const open of [...this.expanded]) if (open === path || open.startsWith(path + '/')) this.expanded.delete(open)
+    if (this.selected === path) this.selected = dir
   }
 
   // The visible rows; `keep` names paths a long folder must still show.

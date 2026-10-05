@@ -108,6 +108,14 @@ function toBase64(bytes: Uint8Array): string {
   return parts.join('')
 }
 
+const MARKER = 0xffd75f
+
+// `a` laid over `b` at `share` of its strength.
+function mix(a: number, b: number, share: number): number {
+  const channel = (shift: number) => Math.round(((a >> shift) & 255) * share + ((b >> shift) & 255) * (1 - share)) << shift
+  return channel(16) | channel(8) | channel(0)
+}
+
 // Fades a color toward the background, as gitlogue dims rows away from the cursor.
 function fade(fg: number, bg: number, distance: number): number {
   if (distance <= 0 || fg === DEFAULT_COLOR || bg === DEFAULT_COLOR) return fg
@@ -176,6 +184,7 @@ export function paint(player: Player, theme: Theme, layout: Layout, cursorOn: bo
     paintTerminal(canvas, player, theme, { x: leftWidth, y: topRows + 1, w: rightWidth, h: bottomRows }, cursorOn)
   }
   if (player.dialog) paintDialog(canvas, player.dialog, theme)
+  if (player.palette) paintPalette(canvas, player, theme, cursorOn)
   return canvas
 }
 
@@ -233,8 +242,16 @@ function paintEditor(canvas: Canvas, player: Player, theme: Theme, box: Box, cur
     const from = sub * textWidth
     const to = Math.min(line.length, from + textWidth)
     const x0 = area.x + gutter
-    for (let col = from; col < to; col++)
-      canvas.set(x0 + col - from, y, line[col], fade(tokenColor(theme, toks[col]), rowBg, distance), rowBg)
+    // The highlighter: over the text of each line read, from its first word.
+    const marks = player.marks
+    const markEnd =
+      !marks || index < marks.from || index > marks.line ? 0 : index < marks.line ? line.length : marks.col
+    const markStart = line.length - line.trimStart().length
+    for (let col = from; col < to; col++) {
+      const isMarked = col >= markStart && col < markEnd
+      const cellBg = isMarked ? mix(MARKER, rowBg, 0.34) : rowBg
+      canvas.set(x0 + col - from, y, line[col], fade(tokenColor(theme, toks[col]), cellBg, isMarked ? 0 : distance), cellBg)
+    }
 
     if (isCursorLine && showCursor) {
       const isLastRow = sub === rowsOf(line) - 1
@@ -297,6 +314,14 @@ function paintExplorer(canvas: Canvas, player: Player, theme: Theme, area: Box) 
           put('  ' + row.name, theme.fileTreeDefault)
           break
         }
+        if (entry.committed) {
+          put('✓ ' + row.name, theme.editorLineNumber)
+          break
+        }
+        if (player.flight && row.path === player.explorer.selected) {
+          put('  ' + row.name, theme.separator)
+          break
+        }
         put(entry.status + ' ', entry.status === '+' ? theme.fileTreeAdded : theme.fileTreeModified)
         put(row.name, isSelected ? theme.fileTreeCurrentFileFg : theme.fileTreeDefault)
         if (entry.note) {
@@ -308,6 +333,7 @@ function paintExplorer(canvas: Canvas, player: Player, theme: Theme, area: Box) 
         break
     }
   }
+  paintTrash(canvas, player, theme, area, offset)
 }
 
 // Where the picture sits in the image viewer, in cells of the right column:
@@ -478,6 +504,113 @@ function searchBox(canvas: Canvas, theme: Theme, x: number, y: number, width: nu
   if (cursor) canvas.set(end, y + 1, ' ', theme.editorCursorCharFg, theme.editorCursorCharBg)
 }
 
+// The trash, in the explorer's lower right, once anything has gone to it: a
+// can whose lid lifts as a file comes, and the file's name on its way there.
+function paintTrash(canvas: Canvas, player: Player, theme: Theme, area: Box, offset: number) {
+  const flight = player.flight
+  if (!flight && player.trashed === 0) return
+  const bg = theme.backgroundLeft
+  const x = area.x + area.w - 7
+  const y = area.y + area.h - 4
+  if (x < area.x || y < area.y) return
+  const isOpen = flight !== undefined && flight.t > 0.45
+  const edge = theme.editorLineNumber
+  canvas.text(x, y, isOpen ? ' ▁▁▁▁╱' : '      ', edge, bg)
+  canvas.text(x, y + 1, isOpen ? '      ' : ' ▁▄▄▁ ', edge, bg)
+  canvas.text(x, y + 2, '▕┊┊┊┊▏', edge, bg)
+  canvas.text(x, y + 3, ' ▔▔▔▔ ', edge, bg)
+  if (player.trashed > 0) canvas.text(x + 6, y + 3, String(player.trashed), theme.fileTreeDeleted, bg)
+  if (!flight) return
+  // From the file's row to the can's mouth, rising and then dropping in.
+  const t = flight.t
+  const eased = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2
+  const fromX = area.x + flight.depth * 2 + 2
+  const fromY = area.y + flight.row - offset
+  const toX = x + 1
+  const toY = y + 1
+  const fx = Math.round(fromX + (toX - fromX) * eased)
+  const fy = Math.round(fromY + (toY - fromY) * eased - Math.sin(Math.PI * t) * 3)
+  const label = t > 0.85 ? '·' : flight.name.length > 20 ? flight.name.slice(0, 19) + '…' : flight.name
+  canvas.text(Math.max(area.x, Math.min(fx, area.x + area.w - label.length)), Math.max(area.y, fy), label, theme.fileTreeDeleted, bg, area.x + area.w)
+}
+
+// The sidebar's search view, as the editor's: the query in its box, the
+// count, then each file with its matching lines, the match itself marked.
+function paintSearch(canvas: Canvas, player: Player, theme: Theme, area: Box) {
+  const bg = theme.backgroundLeft
+  const search = player.search!
+  const maxX = area.x + area.w
+  canvas.text(area.x, area.y, 'SEARCH', theme.editorLineNumber, bg)
+  const box = theme.editorCursorLineBg
+  canvas.background(area.x, area.y + 1, area.w, box)
+  const room = area.w - 2
+  const query = search.query.length > room ? '…' + search.query.slice(search.query.length - room + 1) : search.query
+  const end = canvas.text(area.x + 1, area.y + 1, query, theme.fileTreeCurrentFileFg, box, maxX)
+  if (player.active === 'explorer' && search.shown === 0) canvas.set(Math.min(end, maxX - 1), area.y + 1, ' ', theme.editorCursorCharFg, theme.editorCursorCharBg)
+  const files = search.hits.slice(0, search.shown)
+  const matches = files.reduce((n, hit) => n + Math.max(1, hit.matches.length), 0)
+  if (search.shown > 0)
+    canvas.text(area.x, area.y + 2, `${search.total || matches} results in ${search.hits.length} files`, theme.editorLineNumber, bg, maxX)
+  let pattern: RegExp | undefined
+  try {
+    pattern = new RegExp(search.query, 'i')
+  } catch {
+    pattern = undefined
+  }
+  let y = area.y + 4
+  for (const hit of files) {
+    if (y >= area.y + area.h) break
+    const name = hit.path.slice(hit.path.lastIndexOf('/') + 1)
+    const folder = hit.path.slice(0, Math.max(0, hit.path.lastIndexOf('/')))
+    let x = canvas.text(area.x, y, '▾ ' + name, theme.fileTreeDefault, bg, maxX)
+    x = canvas.text(x + 1, y, folder, theme.editorLineNumber, bg, maxX - 4)
+    if (hit.matches.length > 0) canvas.text(maxX - String(hit.matches.length).length - 1, y, String(hit.matches.length), theme.statusHash, bg, maxX)
+    y++
+    for (const match of hit.matches) {
+      if (y >= area.y + area.h) break
+      const text = match.text.trimStart()
+      const found = pattern?.exec(text)
+      const cut = Math.max(0, (found?.index ?? 0) - 8)
+      const shown = (cut > 0 ? '…' : '') + text.slice(cut)
+      const at = found ? found.index - cut + (cut > 0 ? 1 : 0) : -1
+      canvas.text(area.x + 3, y, shown, theme.terminalOutput, bg, maxX)
+      if (found && at >= 0)
+        for (let i = 0; i < found[0].length && area.x + 3 + at + i < maxX; i++)
+          canvas.set(area.x + 3 + at + i, y, shown[at + i] ?? ' ', theme.fileTreeCurrentFileFg, mix(MARKER, bg, 0.3))
+      y++
+    }
+  }
+}
+
+// The quick-open palette, at the top middle of the pane: the pattern typed,
+// and the files it finds beneath.
+function paintPalette(canvas: Canvas, player: Player, theme: Theme, cursorOn: boolean) {
+  const palette = player.palette!
+  const width = Math.min(canvas.width - 4, 64)
+  if (width < 16) return
+  const x = Math.floor((canvas.width - width) / 2)
+  const y = 1
+  const fg = theme.fileTreeCurrentFileFg
+  const bg = theme.editorCursorLineBg
+  const rows = 1 + palette.shown
+  canvas.fill(x, y, width, rows + 2, bg)
+  canvas.text(x, y, '┌' + '─'.repeat(width - 2) + '┐', theme.separator, bg)
+  for (let r = 1; r <= rows; r++) {
+    canvas.set(x, y + r, '│', theme.separator, bg)
+    canvas.set(x + width - 1, y + r, '│', theme.separator, bg)
+  }
+  canvas.text(x, y + rows + 1, '└' + '─'.repeat(width - 2) + '┘', theme.separator, bg)
+  const end = canvas.text(x + 2, y + 1, palette.text, fg, bg, x + width - 2)
+  if (cursorOn && palette.shown === 0) canvas.set(end, y + 1, ' ', theme.editorCursorCharFg, theme.editorCursorCharBg)
+  palette.items.slice(0, palette.shown).forEach((item, i) => {
+    const rowBg = i === 0 ? theme.fileTreeCurrentFileBg : bg
+    canvas.background(x + 1, y + 2 + i, width - 2, rowBg)
+    const name = item.slice(item.lastIndexOf('/') + 1)
+    const nx = canvas.text(x + 2, y + 2 + i, name, fg, rowBg, x + width - 2)
+    canvas.text(nx + 1, y + 2 + i, item.slice(0, Math.max(0, item.lastIndexOf('/'))), theme.editorLineNumber, rowBg, x + width - 2)
+  })
+}
+
 type TreeRow = { dir: string } | { entry: FileEntry; name: string; indent: boolean }
 
 function treeRows(files: Map<string, FileEntry>): TreeRow[] {
@@ -502,6 +635,7 @@ function paintTree(canvas: Canvas, player: Player, theme: Theme, box: Box) {
   canvas.fill(box.x, box.y, box.w, box.h, bg)
   const area = inner(box)
   if (area.w <= 0 || area.h <= 0) return
+  if (player.sidebar === 'search' && player.search) return paintSearch(canvas, player, theme, area)
   if (player.explorer.roots.length > 0) return paintExplorer(canvas, player, theme, area)
   const rows = treeRows(player.files)
   // Files the current turn has not touched recede.
@@ -540,6 +674,11 @@ function paintTree(canvas: Canvas, player: Player, theme: Theme, box: Box) {
     x = canvas.text(x, y, ` +${entry.added}`, dim(theme.fileTreeStatsAdded), rowBg, maxX)
     canvas.text(x, y, ` -${entry.deleted}`, dim(theme.fileTreeStatsDeleted), rowBg, maxX)
   }
+}
+
+function elapsed(ms: number): string {
+  const s = Math.floor(ms / 1000)
+  return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`
 }
 
 // Claude's own mark, the one color the terminal keeps whatever the theme.
@@ -594,9 +733,28 @@ function paintTerminal(canvas: Canvas, player: Player, theme: Theme, box: Box, c
           x = maxX - right.length
           put(right.slice(0, cut + 1), theme.terminalOutput)
           put(right.slice(cut + 1), line.ok ? theme.fileTreeAdded : theme.fileTreeDeleted)
+        } else if (line.running && line.startedAt) {
+          // Still running: a spinner and the time so far.
+          const spinner = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+          const now = Date.now()
+          const status = `${spinner[Math.floor(now / 100) % spinner.length]} ${elapsed(now - line.startedAt)}`
+          x = maxX - status.length
+          put(status, theme.editorCursorCharBg)
         }
         break
       }
+      case 'commit': {
+        put('◆ ', CLAUDE)
+        put(line.sha ?? '', theme.statusHash)
+        if (line.branch) put(` (${line.branch})`, theme.statusDate)
+        put(' ' + fit(line.text, Math.max(0, maxX - x - 1)), theme.terminalCommand)
+        break
+      }
+      case 'trash':
+        put('✗ ', theme.fileTreeDeleted)
+        put('moved to trash  ', theme.terminalOutput)
+        put(fit(line.text, Math.max(0, maxX - x)), theme.fileTreeDeleted)
+        break
       case 'output':
         put(line.first ? '  ⎿  ' : '     ', theme.separator)
         put(fit(line.text, area.w - 5), theme.terminalOutput)
@@ -624,7 +782,7 @@ function paintTerminal(canvas: Canvas, player: Player, theme: Theme, box: Box, c
         break
       case 'progress': {
         const done = (line.fraction ?? 0) >= 1
-        put(done ? '✓ ' : '↓ ', done ? theme.fileTreeAdded : CLAUDE)
+        put(done ? '✓ ' : line.up ? '↑ ' : '↓ ', done ? theme.fileTreeAdded : CLAUDE)
         put(fit(line.text, Math.max(8, Math.floor(area.w / 3))) + ' ', theme.terminalCommand)
         const barWidth = Math.max(4, maxX - x - right.length - 2)
         const full = Math.round(barWidth * (line.fraction ?? 0))
