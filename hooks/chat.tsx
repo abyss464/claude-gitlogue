@@ -157,9 +157,9 @@ export function drawPhone(
   })
   if (chat.isWorking)
     messages.push(
-      <Box flexDirection="row" marginTop={1} flexShrink={0}>
-        <Box width={AVATAR_WIDTH}>
-          <Text color={CLAUDE}>{MASCOT[1]}</Text>
+      <Box flexDirection="row" marginTop={1} flexShrink={0} alignItems="center">
+        <Box width={AVATAR_WIDTH} flexDirection="column">
+          {MASCOT.map(row => <Text color={CLAUDE}>{row}</Text>)}
         </Box>
         <Box paddingX={1} backgroundColor={hex(THEIRS)}>
           <Text>···</Text>
@@ -217,6 +217,13 @@ export function registerChat(on: On, ctx: { isOn: () => boolean; chat: Chat }) {
       }
     }
     return stored
+  })
+
+  // Whether Claude is at work, as the band over the prompt knows it: right
+  // even when the mod loaded in the middle of a turn.
+  on('ui.render', { component: 'AbovePrompt' }, ($, e, next) => {
+    chat.working(e.props.isWorking)
+    return next(e)
   })
 
   // The transcript's own rows step aside while the phone holds the conversation.
