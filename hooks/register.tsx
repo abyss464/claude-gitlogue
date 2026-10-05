@@ -5,7 +5,7 @@
 
 import type { Register } from 'claude-code'
 
-import type { GitlogueLink, GitloguePlace, GitlogueSaved } from '../types'
+import type { GitlogueLink, GitloguePlace, GitlogueSaved, GitlogueCapture } from '../types'
 
 import { candidatePaths, commitMessageOf, downloadTargets, hitsOf, reverseApply, searchOf, type EngineHunk } from './bashfiles'
 import { chainTo, parentOf, type DirEntry } from './explorer'
@@ -26,6 +26,11 @@ const SCREENS_TOOL = 'mcp__hypr-screens__'
 const CAST_SPEED = 2
 const CAST_FPS_LIMIT = 30
 const CAST_LONGEST_PLAY_SECONDS = 8
+// Commands that grab screens, and those that make pictures out of pictures
+// (frames from a clip, a sheet of frames): from captures, they are captures.
+const GRABBING = /(^|[\s;&|(])(grim|import|scrot|spectacle|gnome-screenshot|hyprshot|flameshot|wf-recorder)\b|x11grab|kmsgrab/
+const KEPT_CAPTURES = 40
+const DERIVING = /(^|[\s;&|(])(magick|montage|convert|ffmpeg)\b/
 // With the chat in it, the pane asks to take nearly the whole width: the
 // transcript beside it has nothing left to show.
 const WIDE_DOCK = 400
@@ -91,6 +96,11 @@ export const register: Register = (on, options) => {
   let isDecoding = false
   let shownCastFrame: string | undefined
   const seenClips = new Set<string>()
+  // Where and when commands left screen captures (screenshots, frames, sheets
+  // tiled from them): looking at one shows what a recording already shows.
+  // Kept with the session's state, so a reload remembers them.
+  const captures: GitlogueCapture[] = []
+  let capturesChanged = false
   let shownChat = -1
   let lastTick = Date.now()
   let sent = { tree: '', main: '' }
@@ -165,9 +175,10 @@ export const register: Register = (on, options) => {
 
     let savedVersion = -1
     persist = () => {
-      if (player.saveVersion === savedVersion) return
+      if (player.saveVersion === savedVersion && !capturesChanged) return
       savedVersion = player.saveVersion
-      void $.state.set(SAVED, { ...player.save(), session }).catch(() => {})
+      capturesChanged = false
+      void $.state.set(SAVED, { ...player.save(), session, captures }).catch(() => {})
       keep()
     }
 
@@ -175,7 +186,10 @@ export const register: Register = (on, options) => {
     // changed option) or from an earlier run this session resumes.
     const load = async () => {
       const { value: live } = await $.state.get(SAVED)
-      if (live && live.session === session) return player.restore(live)
+      if (live && live.session === session) {
+        captures.splice(0, captures.length, ...(live.captures ?? []))
+        return player.restore(live)
+      }
       const kept = (await $.store.get(recordKey(session))) as GitlogueSaved | undefined
       if (kept?.view) {
         player.restore(kept)
@@ -510,6 +524,20 @@ export const register: Register = (on, options) => {
         const old = file.created ? '' : reverseApply(now, file.hunks)
         if (old !== now) edits.push(await editOf(file.filePath, old, now, file.created === true))
       }
+      // Where the command left screen captures, and when.
+      const derived =
+        DERIVING.test(command) &&
+        paths.some(
+          path =>
+            /\/hypr-screens\/recordings\//.test(path) ||
+            captures.some(c => [path, parentOf(path), parentOf(parentOf(path))].some(dir => c.dirs.includes(dir))),
+        )
+      if (castEnabled && (GRABBING.test(command) || derived)) {
+        captures.push({ dirs: [...new Set(paths.flatMap(path => [path, parentOf(path)]))], from: startedAt - 1000, to: Date.now() + 1000 })
+        captures.splice(0, Math.max(0, captures.length - KEPT_CAPTURES))
+        capturesChanged = true
+      }
+
       // What the command removed, outermost only: a folder's files go with it.
       const gone: string[] = []
       for (const [path, kind] of existed)
@@ -615,6 +643,15 @@ export const register: Register = (on, options) => {
       }
       if (result?.type !== 'image') return ran
       const file = String((e as { file_path?: unknown }).file_path ?? '')
+      // Claude's screens are recorded: a capture of one is that recording again.
+      if (castEnabled) {
+        const stat = await $.fs.stat(file).catch(() => undefined)
+        const captured =
+          /\/hypr-screens\/recordings\//.test(file) ||
+          (stat !== undefined &&
+            captures.some(c => (c.dirs.includes(file) || c.dirs.includes(parentOf(file))) && stat.mtimeMs >= c.from && stat.mtimeMs <= c.to))
+        if (captured) return ran
+      }
       // The terminal shows PNGs; anything else is shown through a PNG copy.
       let png = file
       if (!/\.png$/i.test(file)) {

@@ -58,6 +58,8 @@ const spoken = (text: string) =>
     .replace(/<(system-reminder|command-[\w-]+|local-command-[\w-]+|task-notification)>[\s\S]*?<\/\1>/g, '')
     .trim()
 
+const LONGEST_MESSAGE = 4000
+
 export class Chat {
   lines: ChatLine[] = []
   isWorking = false
@@ -90,6 +92,8 @@ export class Chat {
 
   add(line: ChatLine) {
     if (!line.text.trim()) return
+    // The terminal draws no text longer than 10000 characters in one piece.
+    if (line.text.length > LONGEST_MESSAGE) line = { ...line, text: line.text.slice(0, LONGEST_MESSAGE) + '…' }
     // Read back up the chat, the view stays on what it shows as new lines come.
     if (this.scroll > 0) this.scroll += this.rowsOf(line, this.lines.length)
     this.lines.push(line)
@@ -102,6 +106,8 @@ export class Chat {
   load(messages: readonly { role: 'user' | 'assistant'; text: string }[]) {
     this.lines = []
     for (const message of messages) {
+      // A compacted conversation's summary is no one's message.
+      if (message.role === 'user' && message.text.startsWith('This session is being continued from a previous conversation')) continue
       const text = message.role === 'user' ? spoken(message.text) : message.text.trim()
       if (text) this.add({ role: message.role === 'user' ? 'me' : 'claude', text, isRead: true })
     }

@@ -138,7 +138,9 @@ export type GitlogueView = {
 }
 
 // `session` names the session the replay belongs to, where it is recorded.
-export type GitlogueSaved = { view: GitlogueView; pending: GitlogueEvent[]; session?: string }
+export type GitlogueSaved = { view: GitlogueView; pending: GitlogueEvent[]; session?: string; captures?: GitlogueCapture[] }
+/** Where and when a command left screen captures. */
+export type GitlogueCapture = { dirs: string[]; from: number; to: number }
 
 declare module 'claude-code' {
   interface PluginState {
