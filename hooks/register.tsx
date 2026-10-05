@@ -31,9 +31,9 @@ const CAST_LONGEST_PLAY_SECONDS = 8
 const GRABBING = /(^|[\s;&|(])(grim|import|scrot|spectacle|gnome-screenshot|hyprshot|flameshot|wf-recorder)\b|x11grab|kmsgrab/
 const KEPT_CAPTURES = 40
 // The shape a chat is kept in; one kept in another is read again.
-const CHAT_FORMAT = 1
+const CHAT_FORMAT = 2
 const TRANSCRIPT_READ =
-  'f=$(ls "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/projects/*/"$1".jsonl 2>/dev/null | head -n 1); [ -n "$f" ] && jq -c "$2" "$f" 2>/dev/null | tail -n 400'
+  'f=$(ls "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/projects/*/"$1".jsonl 2>/dev/null | head -n 1); [ -n "$f" ] && jq -c "$2" "$f" 2>/dev/null'
 // The person's prompts (typed, or sent while Claude worked) and Claude's
 // words, from a transcript file: one {role, text} per line.
 const TRANSCRIPT_CHAT = `
@@ -57,6 +57,9 @@ const WIDE_DOCK = 400
 // the 4 MiB store.
 const KEPT_SESSIONS = 3
 const MAX_RECORD_CHARS = 1_000_000
+// A session's chat as kept for /resume, beside its replay: the newest lines
+// within this many characters (the session itself holds all of them).
+const MAX_CHAT_CHARS = 200_000
 const RECENT_KEY = 'replays'
 const recordKey = (session: string) => `replay:${session}`
 
@@ -168,12 +171,18 @@ export const register: Register = (on, options) => {
     // The replay as a record small enough to keep: everything still to play,
     // else the panes alone, else the panes without the open file.
     const record = (): GitlogueSaved => {
+      // The chat, its oldest lines left out past its share of the store.
+      let size = 2
+      let start = chat.lines.length
+      while (start > 0 && size + JSON.stringify(chat.lines[start - 1]).length + 1 <= MAX_CHAT_CHARS)
+        size += JSON.stringify(chat.lines[--start]).length + 1
+      const kept = { format: CHAT_FORMAT, lines: chat.lines.slice(start) }
       const full = player.save()
-      if (JSON.stringify(full).length <= MAX_RECORD_CHARS) return { ...full, chat: { format: CHAT_FORMAT, lines: chat.lines } }
+      if (JSON.stringify(full).length <= MAX_RECORD_CHARS) return { ...full, chat: kept }
       const view = player.view()
       const panes = { view, pending: [] }
-      if (JSON.stringify(panes).length <= MAX_RECORD_CHARS) return { ...panes, chat: { format: CHAT_FORMAT, lines: chat.lines } }
-      return { view: { ...view, lines: [''], hasFile: false, currentPath: null }, pending: [], chat: { format: CHAT_FORMAT, lines: chat.lines } }
+      if (JSON.stringify(panes).length <= MAX_RECORD_CHARS) return { ...panes, chat: kept }
+      return { view: { ...view, lines: [''], hasFile: false, currentPath: null }, pending: [], chat: kept }
     }
 
     // Kept for /resume, at most every couple of seconds while playing and
@@ -425,7 +434,7 @@ export const register: Register = (on, options) => {
 
   on('tool.call', { tool: 'mcp__gitlogue__refresh' }, ($, e) => {
     const lift = (e as { chat_scroll?: unknown }).chat_scroll
-    if (typeof lift === 'number') chat.scrollBy(lift - chat.scroll)
+    if (typeof lift === 'number') chat.scrollTo(lift)
     $.ui.invalidate('ui.render')
     return { result: 'The gitlogue mod is running its latest code; its pane and chat view are redrawn.' }
   })

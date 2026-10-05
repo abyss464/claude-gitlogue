@@ -18,7 +18,6 @@ const FIELD = 0x3a4256
 // Claude Code's mascot, as its welcome banner draws it.
 const MASCOT = [' ▐▛███▜▌ ', '▝▜█████▛▘', '  ▘▘ ▝▝  ']
 const AVATAR_WIDTH = 10
-const KEPT_MESSAGES = 60
 
 export type ChatLine = GitlogueChatLine
 
@@ -64,8 +63,10 @@ export class Chat {
   lines: ChatLine[] = []
   isWorking = false
   version = 0
-  // How many rows the messages are lifted from the bottom: 0 follows the newest.
-  scroll = 0
+  // Read back up the chat, the message standing on the phone's floor and how
+  // many rows it has sunk below it; null follows the newest.
+  floor: number | null = null
+  lift = 0
   // The phone as last drawn, to measure scrolling against.
   view = { width: 60, rows: 20 }
 
@@ -81,23 +82,47 @@ export class Chat {
     return wrapped + 2 + (line.role === 'me' ? 1 : first ? 2 : 0)
   }
 
-  // Lifts the messages by `rows` (down when negative), within what there is.
+  // Sinks the messages by `rows`, bringing older ones into view (newer ones
+  // when negative). Rows are only measured around the message on the floor,
+  // so the oldest is as reachable as the newest however long the chat.
   scrollBy(rows: number) {
-    const total = this.lines.slice(-KEPT_MESSAGES).reduce((n, line, i, all) => n + this.rowsOf(line, this.lines.length - all.length + i), 0)
-    const next = Math.max(0, Math.min(this.scroll + rows, total - this.view.rows + 2))
-    if (next === this.scroll) return
-    this.scroll = next
+    const last = this.lines.length - 1
+    if (last < 0) return
+    const rowsAt = (i: number) => this.rowsOf(this.lines[i]!, i)
+    let at = this.floor ?? last
+    let lift = this.lift + rows
+    while (at > 0 && lift >= rowsAt(at)) lift -= rowsAt(at--)
+    while (lift < 0 && at < last) lift += rowsAt(++at)
+    // The oldest message stops a little below the top of the phone.
+    const room = this.view.rows - 2 - Math.floor(this.view.rows / 3)
+    let above = -lift
+    for (let i = 0; i <= at && above < room; i++) above += rowsAt(i)
+    if (above < room) {
+      lift -= room - above
+      while (lift < 0 && at < last) lift += rowsAt(++at)
+    }
+    const floor = at === last && lift <= 0 ? null : at
+    lift = floor === null ? 0 : lift
+    if (floor === this.floor && lift === this.lift) return
+    this.floor = floor
+    this.lift = lift
     this.version++
+  }
+
+  // Back to the newest, then `rows` up from it.
+  scrollTo(rows: number) {
+    this.floor = null
+    this.lift = 0
+    this.version++
+    this.scrollBy(rows)
   }
 
   add(line: ChatLine) {
     if (!line.text.trim()) return
     // The terminal draws no text longer than 10000 characters in one piece.
     if (line.text.length > LONGEST_MESSAGE) line = { ...line, text: line.text.slice(0, LONGEST_MESSAGE) + '…' }
-    // Read back up the chat, the view stays on what it shows as new lines come.
-    if (this.scroll > 0) this.scroll += this.rowsOf(line, this.lines.length)
+    // Read back up the chat, the view stays on its floor as new lines come.
     this.lines.push(line)
-    if (this.lines.length > KEPT_MESSAGES * 2) this.lines.splice(0, this.lines.length - KEPT_MESSAGES)
     this.version++
   }
 
@@ -105,7 +130,8 @@ export class Chat {
   // conversation, whose earlier messages the session no longer holds.
   restore(lines: readonly ChatLine[]) {
     this.lines = [...lines]
-    this.scroll = 0
+    this.floor = null
+    this.lift = 0
     this.version++
   }
 
@@ -113,6 +139,8 @@ export class Chat {
   // opens on it.
   load(messages: readonly { role: 'user' | 'assistant'; text: string }[]) {
     this.lines = []
+    this.floor = null
+    this.lift = 0
     for (const message of messages) {
       // A compacted conversation's summary is no one's message.
       if (message.role === 'user' && message.text.startsWith('This session is being continued from a previous conversation')) continue
@@ -151,7 +179,15 @@ export function drawPhone(
   const screen = hex(theme.backgroundLeft)
   const bar = hex(BAR)
   const room = width - 2
-  const messages = chat.lines.slice(-KEPT_MESSAGES).map((line, i, all) => {
+  // Only what the phone shows, and a screen more above it, is laid out: the
+  // whole conversation would be laid out again on every frame.
+  const floor = chat.floor ?? chat.lines.length - 1
+  let start = floor + 1
+  for (let left = chat.lift + 2 * chat.view.rows; start > 0 && left > 0; ) {
+    start--
+    left -= chat.rowsOf(chat.lines[start]!, start)
+  }
+  const messages = chat.lines.slice(start, floor + 1).map((line, i) => {
     if (line.role === 'me') {
       const bubble = bubbleWidth(line.text, Math.floor(room * 0.75), false)
       return (
@@ -174,7 +210,7 @@ export function drawPhone(
         </Box>
       )
     }
-    const first = all[i - 1]?.role !== 'claude'
+    const first = chat.lines[start + i - 1]?.role !== 'claude'
     const fill = hex(THEIRS)
     const bubble = bubbleWidth(line.text, room - AVATAR_WIDTH - 8, true)
     return (
@@ -228,12 +264,12 @@ export function drawPhone(
         <Text dimColor>☏ ≡</Text>
       </Box>
       <Box flexGrow={1} flexDirection="column" justifyContent="flex-end" overflow="hidden" paddingX={1}>
-        {/* The messages stand on the phone's floor; scrolled, they sink below
-            it by that many rows, bringing older ones down into view. */}
-        <Box flexDirection="column" flexShrink={0} marginBottom={-chat.scroll}>
+        {/* The messages stand on the phone's floor; scrolled, the one on the
+            floor sinks below it, bringing older ones down into view. */}
+        <Box flexDirection="column" flexShrink={0} marginBottom={-chat.lift}>
           {messages}
         </Box>
-        {chat.scroll > 0 && (
+        {chat.floor !== null && (
           <Box position="absolute" bottom={0} left={0} width={width} justifyContent="center">
             <Box backgroundColor={bar} paddingX={1}>
               <Text dimColor>↓ 往下滚回到最新</Text>
