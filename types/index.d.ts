@@ -138,7 +138,17 @@ export type GitlogueView = {
 }
 
 // `session` names the session the replay belongs to, where it is recorded.
-export type GitlogueSaved = { view: GitlogueView; pending: GitlogueEvent[]; session?: string; captures?: GitlogueCapture[] }
+export type GitlogueSaved = {
+  view: GitlogueView
+  pending: GitlogueEvent[]
+  session?: string
+  captures?: GitlogueCapture[]
+  chat?: GitlogueChat
+}
+/** The phone's chat as kept; a chat kept in another format is read again from the session. */
+export type GitlogueChat = { format: number; lines: GitlogueChatLine[] }
+/** A line of the phone's chat; `isRead` marks one of the person's that reached Claude. */
+export type GitlogueChatLine = { role: 'me' | 'claude'; text: string; time?: string; isRead?: boolean }
 /** Where and when a command left screen captures. */
 export type GitlogueCapture = { dirs: string[]; from: number; to: number }
 

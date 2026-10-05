@@ -7,6 +7,7 @@
 import type { On } from 'claude-code'
 
 import type { Theme } from './themes'
+import type { GitlogueChatLine } from '../types'
 
 const CLAUDE = '#d77757'
 const MINE = '#06c755'
@@ -19,8 +20,7 @@ const MASCOT = [' ▐▛███▜▌ ', '▝▜█████▛▘', '  ▘
 const AVATAR_WIDTH = 10
 const KEPT_MESSAGES = 60
 
-// `isRead` marks a line of the person's that has reached Claude.
-export type ChatLine = { role: 'me' | 'claude'; text: string; time?: string; isRead?: boolean }
+export type ChatLine = GitlogueChatLine
 
 const isWide = (cp: number) =>
   cp > 0xffff ||
@@ -101,8 +101,16 @@ export class Chat {
     this.version++
   }
 
-  // The conversation so far, read back whenever the mod loads (a reload, a
-  // resumed session), so the phone opens on it.
+  // The chat as it was kept, word for word: it outlives a compacted
+  // conversation, whose earlier messages the session no longer holds.
+  restore(lines: readonly ChatLine[]) {
+    this.lines = [...lines]
+    this.scroll = 0
+    this.version++
+  }
+
+  // The conversation so far, for a session with no kept chat, so the phone
+  // opens on it.
   load(messages: readonly { role: 'user' | 'assistant'; text: string }[]) {
     this.lines = []
     for (const message of messages) {

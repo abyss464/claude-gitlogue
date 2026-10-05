@@ -30,6 +30,25 @@ const CAST_LONGEST_PLAY_SECONDS = 8
 // (frames from a clip, a sheet of frames): from captures, they are captures.
 const GRABBING = /(^|[\s;&|(])(grim|import|scrot|spectacle|gnome-screenshot|hyprshot|flameshot|wf-recorder)\b|x11grab|kmsgrab/
 const KEPT_CAPTURES = 40
+// The shape a chat is kept in; one kept in another is read again.
+const CHAT_FORMAT = 1
+const TRANSCRIPT_READ =
+  'f=$(ls "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/projects/*/"$1".jsonl 2>/dev/null | head -n 1); [ -n "$f" ] && jq -c "$2" "$f" 2>/dev/null | tail -n 400'
+// The person's prompts (typed, or sent while Claude worked) and Claude's
+// words, from a transcript file: one {role, text} per line.
+const TRANSCRIPT_CHAT = `
+  if .isSidechain == true or .isMeta == true or .isCompactSummary == true then empty
+  elif .type == "user" then
+    (.message.content | if type == "string" then . else ([.[]? | select(.type == "text") | .text] | join("\\n")) end) as $text
+    | select(($text | length) > 0 and ([.message.content | arrays | .[] | select(.type == "tool_result")] | length) == 0)
+    | {role: "user", text: $text}
+  elif .type == "attachment" and .attachment.type == "queued_command" and .attachment.origin.kind == "human" then
+    (.attachment.prompt | if type == "string" then . else ([.[]? | select(.type == "text") | .text] | join("\\n")) end) as $text
+    | select($text | length > 0) | {role: "user", text: $text}
+  elif .type == "assistant" then
+    ([.message.content[]? | select(.type == "text") | .text] | join("\\n")) as $text
+    | select($text | length > 0) | {role: "assistant", text: $text}
+  else empty end`
 const DERIVING = /(^|[\s;&|(])(magick|montage|convert|ffmpeg)\b/
 // With the chat in it, the pane asks to take nearly the whole width: the
 // transcript beside it has nothing left to show.
@@ -139,7 +158,6 @@ export const register: Register = (on, options) => {
     runtimeDir = (await $.env.get('XDG_RUNTIME_DIR')) ?? ''
     // Nothing of the screen recordings loads unless their server is connected.
     castEnabled = (await $.tool.list().catch(() => [])).some(tool => tool.name.startsWith(SCREENS_TOOL))
-    chat.load(await $.session.messages().catch(() => []))
     lastTick = Date.now()
 
     let session = await $.session.id()
@@ -151,11 +169,11 @@ export const register: Register = (on, options) => {
     // else the panes alone, else the panes without the open file.
     const record = (): GitlogueSaved => {
       const full = player.save()
-      if (JSON.stringify(full).length <= MAX_RECORD_CHARS) return full
+      if (JSON.stringify(full).length <= MAX_RECORD_CHARS) return { ...full, chat: { format: CHAT_FORMAT, lines: chat.lines } }
       const view = player.view()
       const panes = { view, pending: [] }
-      if (JSON.stringify(panes).length <= MAX_RECORD_CHARS) return panes
-      return { view: { ...view, lines: [''], hasFile: false, currentPath: null }, pending: [] }
+      if (JSON.stringify(panes).length <= MAX_RECORD_CHARS) return { ...panes, chat: { format: CHAT_FORMAT, lines: chat.lines } }
+      return { view: { ...view, lines: [''], hasFile: false, currentPath: null }, pending: [], chat: { format: CHAT_FORMAT, lines: chat.lines } }
     }
 
     // Kept for /resume, at most every couple of seconds while playing and
@@ -174,11 +192,34 @@ export const register: Register = (on, options) => {
     }
 
     let savedVersion = -1
+    let savedChat = -1
+
+    // A session's conversation for the phone, when no chat of it was kept:
+    // from its transcript file (found by the session's id, under whichever
+    // project folder), which still holds what a compaction dropped, else from
+    // the messages the session holds.
+    const conversation = async (id: string): Promise<{ role: 'user' | 'assistant'; text: string }[]> => {
+      const ran = await $.process
+        .run(['sh', '-c', TRANSCRIPT_READ, 'sh', id, TRANSCRIPT_CHAT], { timeoutMs: 60_000 })
+        .catch(() => undefined)
+      const rows = (ran?.stdout ?? '').split('\n').flatMap(row => {
+        try {
+          const message = JSON.parse(row) as { role?: unknown; text?: unknown }
+          const role = message.role === 'user' || message.role === 'assistant' ? message.role : undefined
+          return role && typeof message.text === 'string' ? [{ role: role as 'user' | 'assistant', text: message.text }] : []
+        } catch {
+          return []
+        }
+      })
+      if (rows.length > 0) return rows
+      return id === (await $.session.id()) ? await $.session.messages().catch(() => []) : []
+    }
     persist = () => {
-      if (player.saveVersion === savedVersion && !capturesChanged) return
+      if (player.saveVersion === savedVersion && chat.version === savedChat && !capturesChanged) return
       savedVersion = player.saveVersion
+      savedChat = chat.version
       capturesChanged = false
-      void $.state.set(SAVED, { ...player.save(), session, captures }).catch(() => {})
+      void $.state.set(SAVED, { ...player.save(), session, captures, chat: { format: CHAT_FORMAT, lines: chat.lines } }).catch(() => {})
       keep()
     }
 
@@ -188,9 +229,13 @@ export const register: Register = (on, options) => {
       const { value: live } = await $.state.get(SAVED)
       if (live && live.session === session) {
         captures.splice(0, captures.length, ...(live.captures ?? []))
+        if (live.chat?.format === CHAT_FORMAT) chat.restore(live.chat.lines)
+        else chat.load(await conversation(session))
         return player.restore(live)
       }
       const kept = (await $.store.get(recordKey(session))) as GitlogueSaved | undefined
+      if (kept?.chat?.format === CHAT_FORMAT) chat.restore(kept.chat.lines)
+      else chat.load(await conversation(session))
       if (kept?.view) {
         player.restore(kept)
         player.flush()
@@ -202,6 +247,8 @@ export const register: Register = (on, options) => {
       if (id === session) return
       session = id
       const kept = (await $.store.get(recordKey(id))) as GitlogueSaved | undefined
+      if (kept?.chat?.format === CHAT_FORMAT) chat.restore(kept.chat.lines)
+      else chat.load(await conversation(id))
       if (kept?.view) {
         player.restore(kept)
         player.flush()
