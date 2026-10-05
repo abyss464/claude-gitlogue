@@ -222,6 +222,16 @@ export const register: Register = (on, options) => {
       if (wanted > 0) timer = $.clock.every(wanted, tick)
     }
 
+    // Loaded from a session's mods folder, the mod is being worked on: a tool
+    // that redraws it with its latest code, since calling a plugin's own tool
+    // reloads it first.
+    if ($.plugin.root.includes('/dev-mods/'))
+      await $.tool.register({
+        name: 'refresh',
+        description:
+          "Reload the gitlogue mod with its latest saved code and redraw its pane and chat view, to check a change to the mod before the turn ends. Takes no input.",
+        inputSchema: { type: 'object', properties: {} },
+      })
     await $.command.register({
       name: 'gitlogue',
       description: "Show or hide the gitlogue pane, which replays Claude's edits as live typing",
@@ -260,6 +270,11 @@ export const register: Register = (on, options) => {
   on('classic.SessionStart', async ($, e, next) => {
     if (e.source === 'resume') await resume(e.session_id)
     return next(e)
+  })
+
+  on('tool.call', { tool: 'mcp__gitlogue__refresh' }, $ => {
+    $.ui.invalidate('ui.render')
+    return { result: 'The gitlogue mod is running its latest code; its pane and chat view are redrawn.' }
   })
 
   on('command.run', { command: 'gitlogue' }, async $ => {
