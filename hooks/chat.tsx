@@ -15,6 +15,7 @@ const INK_ON_MINE = '#0a0a0a'
 const MASCOT = [' ▐▛███▜▌ ', '▝▜█████▛▘', '  ▘▘ ▝▝  ']
 const AVATAR_WIDTH = 10
 const PHONE_WIDTH = 76
+const RIGHT_GAP = 4
 const THEIRS = 0x334455
 const BAR = 0x2a3040
 const FIELD = 0x3a4256
@@ -58,10 +59,14 @@ export function registerChat(on: On, ctx: { isOn: () => boolean; theme: Theme; h
     }
     return stamp
   }
-  // The phone's screen within the transcript: against its right edge, beside
-  // the pane, at most a phone wide.
+  // The phone's screen within the transcript: near its right edge, beside the
+  // pane, at most a phone wide. The band over the prompt keeps its last few
+  // columns for its own mark, so the phone leaves that much room everywhere,
+  // and the band lines up by the transcript's width.
+  let transcriptColumns = 80
   const column = (columns: number | undefined) => {
-    const width = Math.max(40, (columns ?? 80) - 1)
+    if (columns) transcriptColumns = columns
+    const width = Math.max(40, transcriptColumns - RIGHT_GAP)
     const phone = Math.min(width, PHONE_WIDTH)
     return { phone, margin: width - phone }
   }
@@ -195,12 +200,12 @@ export function registerChat(on: On, ctx: { isOn: () => boolean; theme: Theme; h
   on('ui.render', { component: 'AbovePrompt' }, ($, e, next) => {
     if (!ctx.isOn() || e.surface !== 'terminal' || e.props.hasSurvey) return next(e)
     const { Box, Text } = $.ui.resolve(e)
-    const { phone, margin } = column(e.props.bodyColumns + 1)
+    const { phone, margin } = column(undefined)
     const bar = ctx.hex(BAR)
     return (
       <Box flexDirection="row">
         <Box width={margin} />
-        <Box width={phone} backgroundColor={bar} flexDirection="row" paddingX={1}>
+        <Box width={Math.max(10, Math.min(phone, e.props.bodyColumns - margin))} backgroundColor={bar} flexDirection="row" paddingX={1}>
           <Text dimColor>＋ ◎ ▣  </Text>
           <Box flexGrow={1} backgroundColor={ctx.hex(FIELD)} paddingX={1}>
             <Text dimColor>Aa</Text>
