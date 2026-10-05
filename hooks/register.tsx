@@ -73,6 +73,8 @@ export const register: Register = (on, options) => {
   const isChatOn = () => chatOption && mounted !== undefined
   let chatShown = false
   let shownCounts = -1
+  // How wide the phone was last drawn: the wheel left of it scrolls the chat.
+  let phoneShown = 0
   let shownChat = -1
   let lastTick = Date.now()
   let sent = { tree: '', main: '' }
@@ -233,8 +235,8 @@ export const register: Register = (on, options) => {
     await $.tool.register({
         name: 'refresh',
         description:
-          "Reload the gitlogue mod with its latest saved code and redraw its pane and chat view, to check a change to the mod before the turn ends. Takes no input.",
-        inputSchema: { type: 'object', properties: {} },
+          'Reload the gitlogue mod with its latest saved code and redraw its pane and chat view, to check a change to the mod before the turn ends. chat_scroll, when given, scrolls the chat that many rows up from its newest line (0 back to the newest).',
+        inputSchema: { type: 'object', properties: { chat_scroll: { type: 'number' } } },
       })
     await $.command.register({
       name: 'gitlogue',
@@ -277,7 +279,9 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
-  on('tool.call', { tool: 'mcp__gitlogue__refresh' }, $ => {
+  on('tool.call', { tool: 'mcp__gitlogue__refresh' }, ($, e) => {
+    const lift = (e as { chat_scroll?: unknown }).chat_scroll
+    if (typeof lift === 'number') chat.scrollBy(lift - chat.scroll)
     $.ui.invalidate('ui.render')
     return { result: 'The gitlogue mod is running its latest code; its pane and chat view are redrawn.' }
   })
@@ -287,6 +291,15 @@ export const register: Register = (on, options) => {
     if (isOpen) await $.ui.close({ id: PANE })
     else await $.ui.open({ id: PANE, title: 'gitlogue', rows: 24, ...(chatOption ? { columns: WIDE_DOCK } : {}) })
     return {}
+  })
+
+  // The wheel over the phone, or the scroll keys while the pane has them,
+  // move the chat's messages; the pane itself stays where it is.
+  on('ui.scroll', { requestId: PANE }, ($, e, next) => {
+    if (!isChatOn() || phoneShown === 0 || (e.pointer && e.pointer.column >= phoneShown)) return next(e)
+    chat.scrollBy(-e.by * (e.pointer ? 3 : 1))
+    $.ui.invalidate('ui.render')
+    return { deny: 'the phone scrolls its own messages' }
   })
 
   on('ui.close', { id: PANE }, ($, e, next) => {
@@ -566,6 +579,7 @@ export const register: Register = (on, options) => {
     }
     // The phone takes the pane's left, the replay the rest.
     const phoneWidth = chatOption ? Math.min(64, Math.max(40, Math.floor(width * 0.34))) : 0
+    phoneShown = phoneWidth
     const layout = layoutFor(width - (phoneWidth ? phoneWidth + 1 : 0), height)
     mounted = layout
     shownTurn = player.turnVersion

@@ -62,9 +62,36 @@ export class Chat {
   lines: ChatLine[] = []
   isWorking = false
   version = 0
+  // How many rows the messages are lifted from the bottom: 0 follows the newest.
+  scroll = 0
+  // The phone as last drawn, to measure scrolling against.
+  view = { width: 60, rows: 20 }
+
+  // About how many rows a line takes in the phone, bubble edges and spacing
+  // included: its text wrapped at its bubble's width.
+  rowsOf(line: ChatLine, index: number): number {
+    const room = this.view.width - 2
+    const inner = line.role === 'me' ? Math.floor(room * 0.75) - 2 : room - AVATAR_WIDTH - 10
+    const wrapped = line.text
+      .split('\n')
+      .reduce((n, text) => n + Math.max(1, Math.ceil(cellWidth(text) / Math.max(8, inner))), 0)
+    const first = line.role === 'claude' && this.lines[index - 1]?.role !== 'claude'
+    return wrapped + 2 + (line.role === 'me' ? 1 : first ? 2 : 0)
+  }
+
+  // Lifts the messages by `rows` (down when negative), within what there is.
+  scrollBy(rows: number) {
+    const total = this.lines.slice(-KEPT_MESSAGES).reduce((n, line, i, all) => n + this.rowsOf(line, this.lines.length - all.length + i), 0)
+    const next = Math.max(0, Math.min(this.scroll + rows, total - this.view.rows + 2))
+    if (next === this.scroll) return
+    this.scroll = next
+    this.version++
+  }
 
   add(line: ChatLine) {
     if (!line.text.trim()) return
+    // Read back up the chat, the view stays on what it shows as new lines come.
+    if (this.scroll > 0) this.scroll += this.rowsOf(line, this.lines.length)
     this.lines.push(line)
     if (this.lines.length > KEPT_MESSAGES * 2) this.lines.splice(0, this.lines.length - KEPT_MESSAGES)
     this.version++
@@ -106,6 +133,7 @@ export function drawPhone(
   height: number,
 ) {
   const { Box, Text, Markdown } = el
+  chat.view = { width, rows: Math.max(1, height - 2) }
   const screen = hex(theme.backgroundLeft)
   const bar = hex(BAR)
   const room = width - 2
@@ -186,7 +214,18 @@ export function drawPhone(
         <Text dimColor>☏ ≡</Text>
       </Box>
       <Box flexGrow={1} flexDirection="column" justifyContent="flex-end" overflow="hidden" paddingX={1}>
-        {messages}
+        {/* The messages stand on the phone's floor; scrolled, they sink below
+            it by that many rows, bringing older ones down into view. */}
+        <Box flexDirection="column" flexShrink={0} marginBottom={-chat.scroll}>
+          {messages}
+        </Box>
+        {chat.scroll > 0 && (
+          <Box position="absolute" bottom={0} left={0} width={width} justifyContent="center">
+            <Box backgroundColor={bar} paddingX={1}>
+              <Text dimColor>↓ 往下滚回到最新</Text>
+            </Box>
+          </Box>
+        )}
       </Box>
       <Box width={width} backgroundColor={bar} flexDirection="row" paddingX={1} flexShrink={0}>
         <Text dimColor>＋ ◎ ▣ </Text>
