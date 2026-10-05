@@ -739,7 +739,7 @@ export class Player {
   // cursor brought to what was read, and the pen drawn along each line of it.
   private scriptRead(event: Extract<PlayerEvent, { type: 'read' }>) {
     const lines = splitLines(event.text)
-    if (lines.length === 0) return
+    if (lines.length === 0 || isLog(event.path)) return
     const isOpen = this.planScreen === 'code' && this.scriptedPath === event.path && this.scriptedText === lines.join('\n')
     this.planScreen = 'code'
     if (!isOpen) {
@@ -1194,9 +1194,13 @@ export class Player {
   }
 }
 
+// Logs and other output a program writes as it runs, rotated ones included.
+const isLog = (path: string) => /\.(log|out|err|ansi|trace|pid|jsonl)(\.\d+)?$/i.test(path)
+
 // Why a change is not typed out, or undefined when it is.
 function untypeable(path: string, hunks: Hunk[]): string | undefined {
   if (LOCK_FILES.has(path.slice(path.lastIndexOf('/') + 1))) return 'lock file'
+  if (isLog(path)) return 'log'
   let typed = 0
   for (const hunk of hunks)
     for (const line of hunk.lines) {
