@@ -4,7 +4,9 @@
 // clock. Pacing constants are gitlogue's, as multiples of the typing speed.
 
 import type {
+  GitlogueBrowser,
   GitlogueEvent,
+  GitlogueImage,
   GitlogueFileEntry,
   GitloguePlace,
   GitlogueSaved,
@@ -39,6 +41,23 @@ const PUSH_OUTPUT_PAUSE = 10.0
 const MAX_TERMINAL_LINES = 300
 const EXPAND_PAUSE = 6.0
 const SELECT_STEP_PAUSE = 1.5
+const PAGE_LOAD_STEPS = 18
+const DOWNLOAD_STEPS = 28
+
+type Screen = 'code' | 'browser' | 'image'
+
+const EMPTY_BROWSER: GitlogueBrowser = {
+  url: '',
+  page: 'home',
+  query: '',
+  results: [],
+  shown: 0,
+  selected: -1,
+  stats: '',
+  body: [],
+  scroll: 0,
+  loading: 1,
+}
 // Past these a change is a machine's output, not something typed: it is
 // counted in the tree and noted in the terminal, never replayed key by key.
 const MAX_TYPED_LINE = 1000
@@ -68,6 +87,12 @@ type StepBody =
   | { k: 'list'; dir: string; entries: DirEntry[]; ensure?: DirEntry }
   | { k: 'expand'; dir: string }
   | { k: 'select'; path: string }
+  | { k: 'screen'; screen: Screen }
+  | { k: 'browse'; set: Partial<GitlogueBrowser> }
+  | { k: 'boxChar'; ch: string }
+  | { k: 'addressChar'; ch: string }
+  | { k: 'image'; image: GitlogueImage }
+  | { k: 'progress'; fraction: number; right?: string }
   | { k: 'dialogOpen' }
   | { k: 'dialogChar'; ch: string }
   | { k: 'termLine'; line: TermLine }
@@ -160,6 +185,14 @@ export class Player {
 
   // The explorer the panes draw, and the copy the script walks ahead on.
   explorer = new Explorer()
+  // What the editor's area shows: code, a browser, or a picture.
+  screen: Screen = 'code'
+  browser: GitlogueBrowser = { ...EMPTY_BROWSER }
+  image: GitlogueImage | undefined
+  // Bumped when the screen or its picture changes, for the drawing that holds it.
+  sceneVersion = 0
+  private planScreen: Screen = 'code'
+  private planBrowser: GitlogueBrowser = { ...EMPTY_BROWSER }
   private plan = new Explorer()
   private planKeep = new Set<string>()
   // A file that starts empty shows one blank line, which its first typed line takes over.
@@ -222,6 +255,12 @@ export class Player {
     this.files = new Map(view.files.map(entry => [entry.path, { ...entry }]))
     this.currentPath = view.currentPath ?? undefined
     this.explorer = Explorer.from(view.explorer)
+    this.screen = view.screen ?? 'code'
+    this.browser = view.browser ? { ...view.browser, results: view.browser.results.slice(), body: view.browser.body.slice() } : { ...EMPTY_BROWSER }
+    this.image = view.image ? { ...view.image } : undefined
+    this.planScreen = this.screen
+    this.planBrowser = { ...this.browser }
+    this.sceneVersion++
     this.plan = this.explorer.clone()
     this.planKeep = new Set(view.files.flatMap(entry => (entry.file ? [entry.file] : [])))
     this.dialog = undefined
@@ -239,6 +278,12 @@ export class Player {
     this.checkpoint = this.view()
     this.saveVersion++
     for (const event of saved.pending) this.enqueue(event)
+  }
+
+  private setScreen(screen: Screen) {
+    if (this.screen === screen) return
+    this.screen = screen
+    this.sceneVersion++
   }
 
   // A new row, taking the place of an idle prompt left at the bottom.
@@ -279,6 +324,9 @@ export class Player {
       files: [...this.files.values()].map(entry => ({ ...entry })),
       currentPath: this.currentPath ?? null,
       explorer: this.explorer.save(),
+      screen: this.screen,
+      browser: { ...this.browser, results: this.browser.results.slice(), body: this.browser.body.slice() },
+      image: this.image ? { ...this.image } : undefined,
     }
   }
 
@@ -323,6 +371,18 @@ export class Player {
         this.pause(PUSH_OUTPUT_PAUSE)
         break
       }
+      case 'search':
+        this.scriptSearch(event)
+        break
+      case 'fetch':
+        this.scriptFetch(event)
+        break
+      case 'image':
+        this.scriptImage(event)
+        break
+      case 'download':
+        this.scriptDownload(event)
+        break
       case 'done':
         this.pause(PUSH_OUTPUT_PAUSE)
         this.push({ k: 'termDone', durationMs: event.durationMs, aborted: event.aborted })
@@ -418,7 +478,10 @@ export class Player {
 
     // The file already open, as the last change left it: keep typing in place.
     const isOpen = this.scriptedPath === event.path
-    if (isOpen && this.scriptedText === oldLines.join('\n')) {
+    // Back from a browser or a picture, the file is opened again even if it was the last.
+    const wasCode = this.planScreen === 'code'
+    this.planScreen = 'code'
+    if (isOpen && wasCode && this.scriptedText === oldLines.join('\n')) {
       this.pause(CHECKOUT_PAUSE)
     } else if (isOpen) {
       this.pause(OPEN_CMD_PAUSE)
@@ -498,6 +561,115 @@ export class Player {
     }
     if (plan.selected !== target) this.push({ k: 'select', path: target }, 0)
     plan.selected = target
+  }
+
+  private toScreen(screen: Screen) {
+    if (this.planScreen === screen) return
+    this.push({ k: 'screen', screen }, 0)
+    this.planScreen = screen
+    this.pause(FILE_SWITCH_PAUSE)
+  }
+
+  private browse(set: Partial<GitlogueBrowser>, dur = this.speedMs) {
+    this.push({ k: 'browse', set }, dur)
+    this.planBrowser = { ...this.planBrowser, ...set }
+  }
+
+  // A page coming in: the bar across the top fills, unevenly, as pages do.
+  private scriptLoad() {
+    let loaded = 0
+    for (let i = 1; i <= PAGE_LOAD_STEPS; i++) {
+      loaded = Math.min(1, loaded + (Math.random() * 2) / PAGE_LOAD_STEPS)
+      this.browse({ loading: i === PAGE_LOAD_STEPS ? 1 : loaded }, this.speedMs * (1 + Math.random() * 2))
+    }
+  }
+
+  // A search, the way a person runs one: the search page, the query typed into
+  // its box, Enter, the results page loading, then the results read down.
+  private scriptSearch(event: Extract<PlayerEvent, { type: 'search' }>) {
+    this.toScreen('browser')
+    this.browse({ url: 'google.com', page: 'home', query: '', results: [], shown: 0, selected: -1, body: [], scroll: 0, loading: 1 })
+    this.pause(CHECKOUT_OUTPUT_PAUSE)
+    for (const ch of cellText(event.query).slice(0, 200)) this.push({ k: 'boxChar', ch }, this.typing())
+    this.pause(OPEN_CMD_PAUSE)
+    const results = event.results.slice(0, 10).map(link => ({ title: cellText(link.title), url: cellText(link.url) }))
+    const seconds = (event.durationMs / 1000).toFixed(2)
+    this.browse({
+      url: `google.com/search?q=${encodeURIComponent(event.query).replace(/%20/g, '+')}`,
+      page: 'results',
+      results,
+      shown: 0,
+      stats: `${results.length} results (${seconds} seconds)`,
+      loading: 0,
+    })
+    this.scriptLoad()
+    for (let i = 1; i <= results.length; i++) this.browse({ shown: i }, this.speedMs * 3)
+    this.pause(HUNK_PAUSE)
+  }
+
+  // A page opened: clicked from the results when it is one of them, else its
+  // address typed; then loaded and read down a screenful at a time.
+  private scriptFetch(event: Extract<PlayerEvent, { type: 'fetch' }>) {
+    this.toScreen('browser')
+    const plan = this.planBrowser
+    const target = plan.page === 'results' ? plan.results.findIndex(link => sameAddress(link.url, event.url)) : -1
+    if (target >= 0) {
+      const from = Math.max(0, plan.selected)
+      const step = target >= from ? 1 : -1
+      for (let i = from; i !== target + step; i += step) this.browse({ selected: i }, this.speedMs * 4)
+      this.pause(OPEN_CMD_PAUSE)
+    } else {
+      this.browse({ url: '' }, this.speedMs * 4)
+      for (const ch of cellText(event.url.replace(/^https?:\/\//, '')).slice(0, 160)) this.push({ k: 'addressChar', ch }, this.typing(0.6))
+      this.pause(OPEN_CMD_PAUSE)
+    }
+    const body = event.text.split('\n').map(cellText)
+    this.browse({ url: cellText(event.url.replace(/^https?:\/\//, '')), page: 'page', body, scroll: 0, loading: 0, selected: -1 })
+    this.scriptLoad()
+    this.pause(CHECKOUT_OUTPUT_PAUSE)
+    const reading = Math.min(body.length, 60)
+    for (let line = 1; line <= reading; line++) this.browse({ scroll: line }, this.speedMs * (line % 8 === 0 ? 12 : 3))
+    this.pause(HUNK_PAUSE)
+  }
+
+  // A picture looked at: found in the explorer, opened, and held a moment.
+  private scriptImage(event: Extract<PlayerEvent, { type: 'image' }>) {
+    if (event.place) this.scriptNavigate(event.file, event.place)
+    this.push({ k: 'image', image: { path: cellText(event.path), png: event.png, width: event.width, height: event.height } }, 0)
+    this.planScreen = 'image'
+    this.pause(HUNK_PAUSE * 1.5)
+  }
+
+  // A download: a bar under its command fills at an uneven pace over about
+  // the time it took, then the file lands in its folder.
+  private scriptDownload(event: Extract<PlayerEvent, { type: 'download' }>) {
+    const name = cellText(event.path.slice(event.path.lastIndexOf('/') + 1))
+    const total = formatBytes(event.bytes)
+    this.push({ k: 'termLine', line: { kind: 'progress', text: name, fraction: 0, right: `0 B / ${total}` } })
+    const span = Math.min(6000, Math.max(900, event.durationMs))
+    let fraction = 0
+    for (let i = 1; i <= DOWNLOAD_STEPS; i++) {
+      fraction = i === DOWNLOAD_STEPS ? 1 : Math.min(0.97, fraction + (Math.random() * 2) / DOWNLOAD_STEPS)
+      const right = `${formatBytes(event.bytes * fraction)} / ${total}`
+      this.push({ k: 'progress', fraction, right }, (span / DOWNLOAD_STEPS) * (0.4 + Math.random() * 1.2))
+    }
+    this.push({ k: 'progress', fraction: 1, right: `${total} · ${formatDuration(event.durationMs, true)}` })
+    if (event.place) {
+      const folder = event.file.slice(0, event.file.lastIndexOf('/'))
+      const entries = event.place.listings[folder]
+      if (entries) {
+        if (!this.plan.roots.includes(event.place.root)) {
+          this.push({ k: 'root', root: event.place.root })
+          this.plan.addRoot(event.place.root)
+        }
+        const ensure = { name: nameOf(event.file), dir: false }
+        this.push({ k: 'list', dir: folder, entries, ensure }, 0)
+        this.plan.list(folder, entries, ensure)
+      }
+      this.planKeep.add(event.file)
+    }
+    this.push({ k: 'count', entry: { path: event.path, status: '+', added: 0, deleted: 0, file: event.file, note: total } })
+    this.pause(GIT_ADD_CMD_PAUSE)
   }
 
   private scriptHunks(oldLines: string[], hunks: Hunk[]) {
@@ -603,6 +775,7 @@ export class Player {
       case 'pause':
         break
       case 'switchFile': {
+        this.setScreen('code')
         this.active = 'editor'
         this.dialog = undefined
         this.hasFile = true
@@ -628,6 +801,37 @@ export class Player {
         this.active = 'explorer'
         this.explorer.selected = step.path
         break
+      case 'screen':
+        this.setScreen(step.screen)
+        break
+      case 'browse':
+        this.active = 'explorer'
+        this.browser = { ...this.browser, focus: undefined, ...step.set }
+        break
+      case 'boxChar':
+        this.active = 'explorer'
+        this.browser = { ...this.browser, query: this.browser.query + step.ch, focus: 'box' }
+        break
+      case 'addressChar':
+        this.active = 'explorer'
+        this.browser = { ...this.browser, url: this.browser.url + step.ch, focus: 'address' }
+        break
+      case 'image':
+        this.image = step.image
+        this.setScreen('image')
+        this.sceneVersion++
+        break
+      case 'progress': {
+        for (let i = this.terminal.length - 1; i >= 0; i--) {
+          const line = this.terminal[i]
+          if (line.kind === 'progress' && (line.fraction ?? 0) < 1) {
+            line.fraction = step.fraction
+            if (step.right) line.right = step.right
+            break
+          }
+        }
+        break
+      }
       case 'count': {
         const known = this.files.get(step.entry.path)
         const turn = this.turn?.id
@@ -702,6 +906,24 @@ function untypeable(path: string, hunks: Hunk[]): string | undefined {
       if (line.kind === 'add') typed += line.text.length
     }
   return typed > MAX_TYPED_CHARS ? 'too large' : undefined
+}
+
+// Whether two addresses name the same page, ignoring scheme and trailing slash.
+function sameAddress(a: string, b: string): boolean {
+  const bare = (url: string) => url.replace(/^https?:\/\//, '').replace(/^www\./, '').replace(/\/$/, '')
+  return bare(a) === bare(b)
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${Math.round(bytes)} B`
+  const units = ['KB', 'MB', 'GB', 'TB']
+  let value = bytes / 1024
+  let unit = 0
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024
+    unit++
+  }
+  return `${value < 10 ? value.toFixed(1) : Math.round(value)} ${units[unit]}`
 }
 
 function formatDuration(ms: number, precise = false): string {

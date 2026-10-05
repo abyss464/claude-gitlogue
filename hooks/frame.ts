@@ -167,7 +167,10 @@ export function paint(player: Player, theme: Theme, layout: Layout, cursorOn: bo
       canvas.fill(0, topRows + 1, leftWidth, bottomRows, theme.backgroundLeft)
     }
   }
-  paintEditor(canvas, player, theme, { x: leftWidth, y: 0, w: rightWidth, h: topRows }, cursorOn)
+  const editorBox = { x: leftWidth, y: 0, w: rightWidth, h: topRows }
+  if (player.screen === 'browser') paintBrowser(canvas, player, theme, editorBox, cursorOn)
+  else if (player.screen === 'image' && player.image) paintViewer(canvas, player, theme, editorBox)
+  else paintEditor(canvas, player, theme, editorBox, cursorOn)
   if (bottomRows > 0) {
     canvas.text(leftWidth, topRows, '─'.repeat(rightWidth), theme.separator, theme.backgroundRight)
     paintTerminal(canvas, player, theme, { x: leftWidth, y: topRows + 1, w: rightWidth, h: bottomRows }, cursorOn)
@@ -296,11 +299,183 @@ function paintExplorer(canvas: Canvas, player: Player, theme: Theme, area: Box) 
         }
         put(entry.status + ' ', entry.status === '+' ? theme.fileTreeAdded : theme.fileTreeModified)
         put(row.name, isSelected ? theme.fileTreeCurrentFileFg : theme.fileTreeDefault)
+        if (entry.note) {
+          put(' ' + entry.note, theme.editorLineNumber)
+          break
+        }
         put(` +${entry.added}`, theme.fileTreeStatsAdded)
         put(` -${entry.deleted}`, theme.fileTreeStatsDeleted)
         break
     }
   }
+}
+
+// Where the picture sits in the image viewer, in cells of the right column:
+// as large as the area allows, at the picture's own proportions (a cell is
+// about twice as tall as it is wide), centred.
+export function imageBox(layout: Layout, image: { width: number; height: number }) {
+  const area = inner({ x: 0, y: 0, w: layout.rightWidth, h: layout.topRows })
+  const top = area.y + 2
+  const room = { columns: Math.min(255, area.w), rows: Math.min(255, area.h - 2) }
+  if (room.columns < 2 || room.rows < 2 || image.width < 1 || image.height < 1) return undefined
+  let columns = room.columns
+  let rows = Math.round((columns * image.height) / image.width / 2)
+  if (rows > room.rows) {
+    rows = room.rows
+    columns = Math.min(room.columns, Math.round((rows * 2 * image.width) / image.height))
+  }
+  columns = Math.max(1, columns)
+  rows = Math.max(1, rows)
+  return {
+    left: area.x + Math.floor((room.columns - columns) / 2),
+    top: top + Math.floor((room.rows - rows) / 2),
+    columns,
+    rows,
+  }
+}
+
+// The picture's frame: its name and size above; the picture itself is laid
+// over the empty area by the pane's drawing.
+function paintViewer(canvas: Canvas, player: Player, theme: Theme, box: Box) {
+  const bg = theme.backgroundRight
+  canvas.fill(box.x, box.y, box.w, box.h, bg)
+  const area = inner(box)
+  const image = player.image
+  if (!image || area.w <= 0 || area.h <= 0) return
+  let x = canvas.text(area.x, area.y, '▣ ', theme.fileTreeModified, bg)
+  x = canvas.text(x, area.y, image.path, theme.fileTreeCurrentFileFg, bg, area.x + area.w)
+  canvas.text(x, area.y, `  ${image.width}×${image.height}`, theme.editorLineNumber, bg, area.x + area.w)
+  canvas.text(area.x, area.y + 1, '─'.repeat(area.w), theme.separator, bg)
+}
+
+const SEARCH_MARK: [string, number][] = [
+  ['G', 0x4285f4],
+  ['o', 0xea4335],
+  ['o', 0xfbbc05],
+  ['g', 0x4285f4],
+  ['l', 0x34a853],
+  ['e', 0xea4335],
+]
+
+// The editor's area as a browser: the address bar and the line that fills as
+// a page loads, over a search page, its results, or the page being read.
+function paintBrowser(canvas: Canvas, player: Player, theme: Theme, box: Box, cursorOn: boolean) {
+  const bg = theme.backgroundRight
+  canvas.fill(box.x, box.y, box.w, box.h, bg)
+  const area = inner(box)
+  if (area.w < 12 || area.h < 4) return
+  const b = player.browser
+  const maxX = area.x + area.w
+  const typing = cursorOn && player.active === 'explorer'
+  const bar = theme.editorCursorLineBg
+
+  // The address bar.
+  let x = canvas.text(area.x, area.y, '‹ › ⟳ ', theme.separator, bg)
+  canvas.background(x, area.y, maxX - x, bar)
+  x = canvas.text(x, area.y, ' ⌕ ', theme.editorLineNumber, bar)
+  const room = maxX - x - 2
+  const url = b.url.length > room ? '…' + b.url.slice(b.url.length - room + 1) : b.url
+  x = canvas.text(x, area.y, url, theme.fileTreeCurrentFileFg, bar, maxX)
+  if (typing && b.focus === 'address') canvas.set(Math.min(x, maxX - 1), area.y, ' ', theme.editorCursorCharFg, theme.editorCursorCharBg)
+
+  // The load line under it.
+  const filled = Math.round(area.w * b.loading)
+  for (let i = 0; i < area.w; i++)
+    canvas.set(area.x + i, area.y + 1, b.loading < 1 && i < filled ? '━' : '─', b.loading < 1 && i < filled ? theme.editorCursorCharBg : theme.separator, bg)
+
+  const top = area.y + 2
+  const rows = area.h - 2
+  const mark = (mx: number, y: number, spaced: boolean) => {
+    for (const [ch, color] of SEARCH_MARK) {
+      canvas.set(mx, y, ch, color, bg)
+      mx += spaced ? 2 : 1
+    }
+    return mx
+  }
+
+  if (b.page === 'home') {
+    const width = Math.min(area.w - 4, 64)
+    const left = area.x + Math.floor((area.w - width) / 2)
+    const y = top + Math.max(0, Math.floor(rows / 2) - 4)
+    mark(area.x + Math.floor((area.w - 11) / 2), y, true)
+    searchBox(canvas, theme, left, y + 2, width, b.query, typing && b.focus === 'box', bg)
+    const buttons = '[ Google Search ]   [ I’m Feeling Lucky ]'
+    canvas.text(area.x + Math.max(0, Math.floor((area.w - buttons.length) / 2)), y + 6, buttons, theme.editorLineNumber, bg, maxX)
+    return
+  }
+
+  if (b.page === 'results') {
+    let mx = mark(area.x, top, false)
+    mx += 2
+    canvas.background(mx, top, Math.min(maxX - mx, Math.max(20, b.query.length + 6)), bar)
+    canvas.text(mx + 1, top, '⌕ ' + b.query, theme.fileTreeCurrentFileFg, bar, maxX)
+    canvas.text(area.x, top + 1, b.loading < 1 ? '' : b.stats, theme.editorLineNumber, bg, maxX)
+    const per = 3
+    const first = Math.max(0, Math.min(b.selected - Math.floor((rows - 3) / per / 2), b.shown - Math.floor((rows - 3) / per)))
+    for (let i = first, y = top + 3; i < b.shown && y + 1 < top + rows; i++, y += per) {
+      const link = b.results[i]
+      const isSelected = i === b.selected
+      const rowBg = isSelected ? bar : bg
+      if (isSelected) {
+        canvas.background(area.x, y, area.w, rowBg)
+        canvas.background(area.x, y + 1, area.w, rowBg)
+      }
+      const host = link.url.replace(/^https?:\/\//, '')
+      canvas.text(area.x + 2, y, host.length > area.w - 2 ? host.slice(0, area.w - 3) + '…' : host, theme.statusAuthor, rowBg, maxX)
+      canvas.text(area.x + 2, y + 1, link.title.length > area.w - 2 ? link.title.slice(0, area.w - 3) + '…' : link.title, theme.syntaxFunction, rowBg, maxX)
+      if (isSelected) canvas.set(area.x, y + 1, '▸', theme.editorCursorCharBg, rowBg)
+    }
+    return
+  }
+
+  // A page being read: its address as the title, the text wrapped, the line
+  // being read a third of the way down and the rest receding from it.
+  canvas.text(area.x, top, b.url.replace(/\/.*$/, ''), theme.statusHash, bg, maxX)
+  const wrapped: { text: string; source: number }[] = []
+  // Wrapped at spaces, as a page reflows; a word longer than a line is cut.
+  b.body.forEach((line, source) => {
+    if (line.length === 0) wrapped.push({ text: '', source })
+    let rest = line
+    while (rest.length > 0) {
+      let cut = rest.length <= area.w ? rest.length : rest.lastIndexOf(' ', area.w)
+      if (cut <= 0) cut = Math.min(area.w, rest.length)
+      wrapped.push({ text: rest.slice(0, cut), source })
+      rest = rest.slice(cut).replace(/^ /, '')
+    }
+  })
+  const start = wrapped.findIndex(row => row.source >= b.scroll)
+  const view = rows - 2
+  const reading = Math.floor(view / 3)
+  const from = Math.max(0, (start < 0 ? wrapped.length : start) - reading)
+  let inFence = false
+  for (let i = 0; i < from; i++) if (/^\s*```/.test(wrapped[i].text)) inFence = !inFence
+  for (let r = 0; r < view && from + r < wrapped.length; r++) {
+    const row = wrapped[from + r]
+    const y = top + 2 + r
+    const distance = Math.abs(r - reading) * 2
+    const fence = /^\s*```/.test(row.text)
+    const color = fence || inFence
+      ? theme.syntaxString
+      : /^\s*#/.test(row.text)
+        ? theme.syntaxKeyword
+        : /^\s*([-*+]|\d+\.)\s/.test(row.text)
+          ? theme.syntaxVariable
+          : theme.terminalCommand
+    if (fence) inFence = !inFence
+    canvas.text(area.x, y, row.text, fade(color, bg, distance), bg, maxX)
+  }
+}
+
+function searchBox(canvas: Canvas, theme: Theme, x: number, y: number, width: number, query: string, cursor: boolean, bg: number) {
+  const edge = theme.editorLineNumber
+  canvas.text(x, y, '╭' + '─'.repeat(width - 2) + '╮', edge, bg)
+  canvas.set(x, y + 1, '│', edge, bg)
+  canvas.set(x + width - 1, y + 1, '│', edge, bg)
+  canvas.text(x, y + 2, '╰' + '─'.repeat(width - 2) + '╯', edge, bg)
+  const room = width - 6
+  const shown = query.length > room ? '…' + query.slice(query.length - room + 1) : query
+  const end = canvas.text(canvas.text(x + 2, y + 1, '⌕ ', theme.editorLineNumber, bg), y + 1, shown, theme.fileTreeCurrentFileFg, bg)
+  if (cursor) canvas.set(end, y + 1, ' ', theme.editorCursorCharFg, theme.editorCursorCharBg)
 }
 
 type TreeRow = { dir: string } | { entry: FileEntry; name: string; indent: boolean }
@@ -447,6 +622,18 @@ function paintTerminal(canvas: Canvas, player: Player, theme: Theme, box: Box, c
       case 'fail':
         put('✗ ' + fit(line.text, area.w - 2), theme.fileTreeDeleted)
         break
+      case 'progress': {
+        const done = (line.fraction ?? 0) >= 1
+        put(done ? '✓ ' : '↓ ', done ? theme.fileTreeAdded : CLAUDE)
+        put(fit(line.text, Math.max(8, Math.floor(area.w / 3))) + ' ', theme.terminalCommand)
+        const barWidth = Math.max(4, maxX - x - right.length - 2)
+        const full = Math.round(barWidth * (line.fraction ?? 0))
+        put('━'.repeat(full), done ? theme.fileTreeAdded : theme.editorCursorCharBg)
+        put('─'.repeat(barWidth - full), theme.separator)
+        x = maxX - right.length
+        put(right, theme.terminalOutput)
+        break
+      }
       case 'prompt':
         put('❯ ', CLAUDE)
         if (isLast && cursorOn) canvas.set(x, y, ' ', theme.terminalCursorFg, theme.terminalCursorBg)

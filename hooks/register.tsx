@@ -5,11 +5,11 @@
 
 import type { Register } from 'claude-code'
 
-import type { GitloguePlace, GitlogueSaved } from '../types'
+import type { GitlogueLink, GitloguePlace, GitlogueSaved } from '../types'
 
-import { candidatePaths, reverseApply, type EngineHunk } from './bashfiles'
+import { candidatePaths, downloadTargets, reverseApply, type EngineHunk } from './bashfiles'
 import { chainTo, parentOf, type DirEntry } from './explorer'
-import { layoutFor, paint, type Layout } from './frame'
+import { imageBox, layoutFor, paint, type Layout } from './frame'
 import { Player, type PlayerEvent } from './player'
 import { DEFAULT_THEME, THEMES } from './themes'
 
@@ -42,6 +42,13 @@ function stamp(ms: number): string {
   return `${d.getFullYear()}-${two(d.getMonth() + 1)}-${two(d.getDate())} ${two(d.getHours())}:${two(d.getMinutes())}:${two(d.getSeconds())}`
 }
 
+// A short, stable name for a path, for the PNG copies of pictures.
+function hashOf(text: string): string {
+  let hash = 0x811c9dc5
+  for (let i = 0; i < text.length; i++) hash = Math.imul(hash ^ text.charCodeAt(i), 0x01000193)
+  return (hash >>> 0).toString(16)
+}
+
 export const register: Register = (on, options) => {
   const theme = THEMES[String(options.theme)] ?? THEMES[DEFAULT_THEME]
   // gitlogue types at 30 ms a character; the playback option scales all of it,
@@ -56,6 +63,7 @@ export const register: Register = (on, options) => {
   // The pane's size while it is drawn; undefined while nobody sees it.
   let mounted: Layout | undefined
   let shownTurn = -1
+  let shownScene = -1
   let lastTick = Date.now()
   let sent = { tree: '', main: '' }
   let isBlitting = false
@@ -168,9 +176,11 @@ export const register: Register = (on, options) => {
       }
       player.advance(dt)
       persist()
-      if (player.turnVersion !== shownTurn) {
-        // The turn info is drawn as text; a redraw remounts the rasters too.
+      if (player.turnVersion !== shownTurn || player.sceneVersion !== shownScene) {
+        // The turn info is drawn as text and a picture as an image; a redraw
+        // remounts the rasters too.
         shownTurn = player.turnVersion
+        shownScene = player.sceneVersion
         $.ui.invalidate('ui.render')
       } else if (!isBlitting) {
         const layout = mounted
@@ -309,9 +319,11 @@ export const register: Register = (on, options) => {
           () => null,
         )
       const home = (await $.env.get('HOME')) ?? ''
+      const shellCwd = await $.session.cwd()
       // The plugins' store is written by this mod itself while commands run.
       const isOwn = (path: string) => path.startsWith(home + '/.claude/plugins/store/')
-      const paths = candidatePaths(command, await $.session.cwd(), home).filter(path => !isOwn(path))
+      const fetched = downloadTargets(command, shellCwd, home)
+      const paths = candidatePaths(command, shellCwd, home).filter(path => !isOwn(path) && !fetched.includes(path))
       const before = new Map<string, string | null>()
       await Promise.all(
         paths.map(async path => {
@@ -324,7 +336,20 @@ export const register: Register = (on, options) => {
       const durationMs = Date.now() - startedAt
 
       const edits: PlayerEvent[] = []
-      const seen = new Set<string>()
+      const seen = new Set<string>(fetched)
+      if (ran.deny === undefined && ran.isError !== true)
+        for (const file of fetched) {
+          const stat = await $.fs.stat(file).catch(() => undefined)
+          if (stat?.kind !== 'file') continue
+          edits.push({
+            type: 'download',
+            path: display(file),
+            file,
+            bytes: stat.size,
+            durationMs,
+            place: await placeOf(file).catch(() => undefined),
+          })
+        }
       for (const [path, old] of before) {
         const now = await look(path).catch(() => undefined)
         if (typeof now !== 'string' || now === old) continue
@@ -359,6 +384,61 @@ export const register: Register = (on, options) => {
       return ran
     }
 
+    if (e.tool === 'WebSearch') {
+      const query = String((e as { query?: unknown }).query ?? '')
+      const startedAt = Date.now()
+      const ran = await next(e)
+      if (ran.deny !== undefined || ran.isError === true) return ran
+      const result = ran.result as { results?: (string | { content?: GitlogueLink[] })[]; durationSeconds?: number } | undefined
+      const results = (result?.results ?? []).flatMap(part => (typeof part === 'string' ? [] : (part.content ?? [])))
+      const durationMs = result?.durationSeconds !== undefined ? result.durationSeconds * 1000 : Date.now() - startedAt
+      enqueue({ type: 'search', query, results, durationMs })
+      return ran
+    }
+
+    if (e.tool === 'WebFetch') {
+      const url = String((e as { url?: unknown }).url ?? '')
+      const startedAt = Date.now()
+      const ran = await next(e)
+      if (ran.deny !== undefined || ran.isError === true) return ran
+      const result = ran.result as { result?: string; url?: string; durationMs?: number } | undefined
+      enqueue({
+        type: 'fetch',
+        url: result?.url ?? url,
+        text: (result?.result ?? ran.text ?? '').slice(0, 20000),
+        durationMs: result?.durationMs ?? Date.now() - startedAt,
+      })
+      return ran
+    }
+
+    if (e.tool === 'Read') {
+      const ran = await next(e)
+      const result = 'result' in ran ? (ran.result as { type?: string; file?: { dimensions?: Record<string, number | undefined> } } | undefined) : undefined
+      if (result?.type !== 'image') return ran
+      const file = String((e as { file_path?: unknown }).file_path ?? '')
+      // The terminal shows PNGs; anything else is shown through a PNG copy.
+      let png = file
+      if (!/\.png$/i.test(file)) {
+        const home = (await $.env.get('HOME')) ?? '/tmp'
+        const stat = await $.fs.stat(file).catch(() => undefined)
+        png = `${home}/.cache/gitlogue/${hashOf(file + ':' + (stat?.mtimeMs ?? 0))}.png`
+        if (!(await $.fs.exists(png).catch(() => false))) {
+          await $.process.run(['mkdir', '-p', parentOf(png)]).catch(() => undefined)
+          const made = await $.process.run(['magick', file + '[0]', '-resize', '1600x1600>', 'png:' + png]).catch(() => undefined)
+          if (made?.exitCode !== 0) return ran
+        }
+      }
+      let width = result.file?.dimensions?.originalWidth ?? 0
+      let height = result.file?.dimensions?.originalHeight ?? 0
+      if (!width || !height) {
+        const size = await $.process.run(['magick', 'identify', '-format', '%w %h', png]).catch(() => undefined)
+        ;[width, height] = (size?.stdout ?? '0 0').split(' ').map(Number)
+      }
+      if (width > 0 && height > 0)
+        enqueue({ type: 'image', path: display(file), file, png, width, height, place: await placeOf(file).catch(() => undefined) })
+      return ran
+    }
+
     if (!EDIT_TOOLS.has(String(e.tool))) return next(e)
     const path = String((e as { file_path?: unknown }).file_path ?? '')
     const read = (): Promise<string | undefined> => $.fs.read(path).then(
@@ -376,7 +456,7 @@ export const register: Register = (on, options) => {
   on('ui.render', { component: 'Pane', requestId: PANE }, ($, e) => {
     const { Box, Text } = $.ui.resolve(e)
     if (e.surface !== 'terminal') return <Text dimColor>gitlogue draws in the terminal.</Text>
-    const { Raster } = $.ui.resolve(e)
+    const { Raster, Image } = $.ui.resolve(e)
 
     const width = Math.min(512, e.props.bodyColumns)
     const height = Math.min(256, e.props.scroll.bodyRows)
@@ -387,11 +467,13 @@ export const register: Register = (on, options) => {
     const layout = layoutFor(width, height)
     mounted = layout
     shownTurn = player.turnVersion
+    shownScene = player.sceneVersion
     const frame = frames(layout)
     sent = { tree: frame.tree, main: frame.main }
     schedule()
 
     const turn = player.turn
+    const picture = player.screen === 'image' && player.image ? imageBox(layout, player.image) : undefined
     const left = hex(theme.backgroundLeft)
     // Each row keeps its height; what does not fit is cut at the bottom.
     const row = (text: ReturnType<typeof Text>) => <Box flexShrink={0}>{text}</Box>
@@ -445,7 +527,20 @@ export const register: Register = (on, options) => {
             )}
           </Box>
         )}
-        <Raster key="main" columns={layout.rightWidth} rows={height} cells={frame.main} />
+        <Box width={layout.rightWidth} height={height}>
+          <Raster key="main" columns={layout.rightWidth} rows={height} cells={frame.main} />
+          {picture && player.image && (
+            <Box position="absolute" top={picture.top} left={picture.left}>
+              <Image
+                key="picture"
+                source={{ file: player.image.png, format: 'png' }}
+                columns={picture.columns}
+                rows={picture.rows}
+                alt={player.image.path}
+              />
+            </Box>
+          )}
+        </Box>
       </Box>
     )
   })
