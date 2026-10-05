@@ -49,6 +49,7 @@ type StepBody =
   | { k: 'move'; line: number; col: number }
   | { k: 'pause' }
   | { k: 'switchFile'; change: FileChange }
+  | { k: 'count'; entry: FileEntry }
   | { k: 'dialogOpen' }
   | { k: 'dialogChar'; ch: string }
   | { k: 'termPrompt' }
@@ -143,6 +144,9 @@ export class Player {
   private wait = 0
   private remaining = 0
   private filesThisTurn = 0
+  // The file the script last left in the editor, and its text then.
+  private scriptedPath: string | undefined
+  private scriptedText: string | undefined
 
   private readonly speedMs: number
   private readonly maxLagMs: number
@@ -241,6 +245,8 @@ export class Player {
 
   private scriptTurn(turn: TurnInfo) {
     this.filesThisTurn = 0
+    this.scriptedPath = undefined
+    this.scriptedText = undefined
     this.push({ k: 'termPrompt' })
     for (const ch of 'claude') this.push({ k: 'termChar', ch }, this.typing())
     this.pause(CHECKOUT_PAUSE)
@@ -261,13 +267,26 @@ export class Player {
       entry: { path: event.path, status: event.created ? '+' : '~', added, deleted },
     }
 
-    this.pause(this.filesThisTurn++ === 0 ? OPEN_FILE_FIRST_PAUSE : OPEN_FILE_PAUSE)
-    this.push({ k: 'dialogOpen' })
-    this.pause(5.0)
-    for (const ch of cellText(event.path)) this.push({ k: 'dialogChar', ch }, this.typing(2))
-    this.pause(OPEN_CMD_PAUSE)
-    this.push({ k: 'switchFile', change })
-    this.pause(FILE_SWITCH_PAUSE)
+    // The file already open, as the last change left it: keep typing in place.
+    const isOpen = this.scriptedPath === event.path
+    if (isOpen && this.scriptedText === oldLines.join('\n')) {
+      this.pause(CHECKOUT_PAUSE)
+    } else if (isOpen) {
+      this.pause(OPEN_CMD_PAUSE)
+      this.push({ k: 'switchFile', change })
+      this.pause(FILE_SWITCH_PAUSE)
+    } else {
+      this.pause(this.filesThisTurn++ === 0 ? OPEN_FILE_FIRST_PAUSE : OPEN_FILE_PAUSE)
+      this.push({ k: 'dialogOpen' })
+      this.pause(5.0)
+      for (const ch of cellText(event.path)) this.push({ k: 'dialogChar', ch }, this.typing(2))
+      this.pause(OPEN_CMD_PAUSE)
+      this.push({ k: 'switchFile', change })
+      this.pause(FILE_SWITCH_PAUSE)
+    }
+    this.push({ k: 'count', entry: change.entry })
+    this.scriptedPath = event.path
+    this.scriptedText = newLines.join('\n')
     this.scriptHunks(oldLines, hunks)
     this.pause(GIT_ADD_PAUSE)
     this.push({ k: 'termOut', text: `✓ ${event.path} +${added} -${deleted}` })
@@ -385,14 +404,18 @@ export class Player {
         this.cursorLine = 0
         this.cursorCol = 0
         this.highlighter.setPath(step.change.path)
-        const known = this.files.get(step.change.path)
-        this.files.set(
-          step.change.path,
-          known
-            ? { ...known, added: known.added + step.change.entry.added, deleted: known.deleted + step.change.entry.deleted }
-            : { ...step.change.entry },
-        )
         this.currentPath = step.change.path
+        break
+      }
+      case 'count': {
+        const known = this.files.get(step.entry.path)
+        this.files.set(
+          step.entry.path,
+          known
+            ? { ...known, added: known.added + step.entry.added, deleted: known.deleted + step.entry.deleted }
+            : { ...step.entry },
+        )
+        this.currentPath = step.entry.path
         break
       }
       case 'dialogOpen':

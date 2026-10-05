@@ -5,6 +5,7 @@
 
 import type { Register } from 'claude-code'
 
+import { candidatePaths, reverseApply, type EngineHunk } from './bashfiles'
 import { layoutFor, paint, type Layout } from './frame'
 import { Player, type PlayerEvent } from './player'
 import { DEFAULT_THEME, THEMES } from './themes'
@@ -13,6 +14,9 @@ const PANE = 'gitlogue'
 const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit'])
 const FAST_TICK_MS = 33
 const BLINK_MS = 500
+const MAX_SNAPSHOT_BYTES = 1_000_000
+
+type BashEditFile = { filePath: string; hunks: EngineHunk[]; created?: true; deleted?: true }
 
 // Rasters paint colors snapped to four bits a channel; text drawn beside them
 // snaps the same way so the two read as one surface.
@@ -148,8 +152,50 @@ export const register: Register = (on, options) => {
 
   on('tool.call', async ($, e, next) => {
     if (e.tool === 'Bash') {
-      enqueue({ type: 'command', command: String((e as { command?: unknown }).command ?? '') })
+      const command = String((e as { command?: unknown }).command ?? '')
+      enqueue({ type: 'command', command })
+
+      // The text of a file now: a string, null when it does not exist, or
+      // undefined when it is no text file to replay (a folder, binary, huge).
+      const look = (path: string): Promise<string | null | undefined> =>
+        $.fs.stat(path).then(
+          stat =>
+            stat.kind === 'file' && stat.size <= MAX_SNAPSHOT_BYTES
+              ? $.fs.read(path).then(text => (typeof text === 'string' && !text.includes('\u0000') ? text : undefined))
+              : undefined,
+          () => null,
+        )
+      const home = (await $.env.get('HOME')) ?? ''
+      const paths = candidatePaths(command, await $.session.cwd(), home)
+      const before = new Map<string, string | null>()
+      await Promise.all(
+        paths.map(async path => {
+          const text = await look(path).catch(() => undefined)
+          if (text !== undefined) before.set(path, text)
+        }),
+      )
+
       const ran = await next(e)
+
+      const edits: PlayerEvent[] = []
+      const seen = new Set<string>()
+      for (const [path, old] of before) {
+        const now = await look(path).catch(() => undefined)
+        if (typeof now !== 'string' || now === old) continue
+        seen.add(path)
+        edits.push({ type: 'edit', path: display(path), before: old ?? '', after: now, created: old === null })
+      }
+      // What the engine saw the command change, for files the command never names.
+      const result = 'result' in ran ? (ran.result as { bashEditDiff?: { files?: BashEditFile[] } } | undefined) : undefined
+      for (const file of result?.bashEditDiff?.files ?? []) {
+        if (file.deleted || seen.has(file.filePath)) continue
+        const now = await look(file.filePath).catch(() => undefined)
+        if (typeof now !== 'string') continue
+        const old = file.created ? '' : reverseApply(now, file.hunks)
+        if (old !== now) edits.push({ type: 'edit', path: display(file.filePath), before: old, after: now, created: file.created === true })
+      }
+      edits.forEach(enqueue)
+
       const text = ran.deny ?? ran.text ?? ''
       const lines = text
         .split('\n')
