@@ -49,7 +49,7 @@ plays those recordings, sped up, instead of showing their screenshots.
 
 ## Options
 
-Set them when installing; each is also a row in `/config`, and a change there applies at once.
+Unset options take their defaults. Set them with `/plugin configure gitlogue@claude-gitlogue`, or as rows in `/config`, where a change applies at once.
 
 | Option | Values | Default |
 | --- | --- | --- |
