@@ -149,7 +149,39 @@ export const register: Register = (on, options) => {
   let persist = () => {}
   let resume = async (_id: string) => {}
 
+  // Replay: every event the pane plays and every change to the phone, kept
+  // per session with its time, so `/gitlogue replay` plays a session again
+  // as it ran. Pictures and screen recordings are copied beside the log,
+  // since the originals change or are removed once played.
+  type ReplayEntry = { at: number; kind: 'event' | 'chat'; op?: 'add' | 'read' | 'working'; data?: unknown }
+  let replayDir = ''
+  let replayFile = ''
+  let replayLog: ReplayEntry[] = []
+  let replaying = false
+  let savePending = false
+  // Set up where the session's engine is in reach, as `schedule` is.
+  let saveLog = () => {}
+  let runCopy = (_argv: string[]) => {}
+  let replay = async (_id: string): Promise<string> => 'gitlogue has not started yet.'
+  const record = (entry: Omit<ReplayEntry, 'at'>) => {
+    if (replaying || !replayFile) return
+    let data = entry.data as PlayerEvent
+    if (entry.kind === 'event' && (data.type === 'cast' || data.type === 'image')) {
+      const keep = `${replayDir}/assets/${Date.now().toString(36)}-${replayLog.length}`
+      if (data.type === 'cast') {
+        runCopy(['sh', '-c', 'mkdir -p "$1" && cp "$@" "$1"/ 2>/dev/null; true', 'sh', keep, ...data.frames])
+        data = { ...data, frames: data.frames.map(f => `${keep}/${f.slice(f.lastIndexOf('/') + 1)}`), remove: [] }
+      } else {
+        runCopy(['sh', '-c', 'mkdir -p "$(dirname "$2")" && cp "$1" "$2"', 'sh', data.png, `${keep}.png`])
+        data = { ...data, png: `${keep}.png` }
+      }
+    }
+    replayLog.push({ at: Date.now(), ...entry, data })
+    saveLog()
+  }
+
   const enqueue = (event: PlayerEvent) => {
+    record({ kind: 'event', data: event })
     player.enqueue(event)
     if (!mounted) player.flush()
     schedule()
@@ -158,12 +190,82 @@ export const register: Register = (on, options) => {
 
   on('session.start', async ($, e, next) => {
     cwd = e.cwd
+    replayDir = `${(await $.env.get('HOME')) ?? '/tmp'}/.cache/gitlogue/replays`
+    await $.process.run(['mkdir', '-p', `${replayDir}/assets`]).catch(() => undefined)
     runtimeDir = (await $.env.get('XDG_RUNTIME_DIR')) ?? ''
     // Nothing of the screen recordings loads unless their server is connected.
     castEnabled = (await $.tool.list().catch(() => [])).some(tool => tool.name.startsWith(SCREENS_TOOL))
     lastTick = Date.now()
 
     let session = await $.session.id()
+    // A resumed session keeps adding to the log it already has.
+    const openLog = async (id: string) => {
+      replayFile = `${replayDir}/${id}.jsonl`
+      const kept = await $.fs.read(replayFile).catch(() => '')
+      replayLog = String(kept)
+        .split('\n')
+        .filter(Boolean)
+        .flatMap(line => {
+          try {
+            return [JSON.parse(line) as ReplayEntry]
+          } catch {
+            return []
+          }
+        })
+    }
+    await openLog(session)
+    saveLog = () => {
+      if (savePending || !replayFile) return
+      savePending = true
+      $.clock.after(1000, () => {
+        savePending = false
+        void $.fs.write(replayFile, replayLog.map(entry => JSON.stringify(entry)).join('\n') + '\n').catch(() => {})
+      })
+    }
+    runCopy = argv => {
+      void $.process.run(argv).catch(() => undefined)
+    }
+    // Plays a session's log again from its start, at the pace it was recorded.
+    replay = async (id: string) => {
+    let file = id ? `${replayDir}/${id.replace(/\.jsonl$/, '')}.jsonl` : ''
+    if (!file) {
+      const logs = (await $.fs.list(replayDir).catch(() => []))
+        .filter(entry => entry.name.endsWith('.jsonl') && `${replayDir}/${entry.name}` !== replayFile)
+        .sort((a, b) => b.mtimeMs - a.mtimeMs)
+      if (!logs.length) return 'No recorded session to replay yet.'
+      file = `${replayDir}/${logs[0].name}`
+    }
+    const text = await $.fs.read(file).catch(() => undefined)
+    if (typeof text !== 'string') return `No replay log at ${file}.`
+    const entries = text
+      .split('\n')
+      .filter(Boolean)
+      .flatMap(line => {
+        try {
+          return [JSON.parse(line) as ReplayEntry]
+        } catch {
+          return []
+        }
+      })
+    if (!entries.length) return `${file} is empty.`
+    replaying = true
+    player.reset()
+    chat.restore([])
+    chatWorking(false)
+    if (!mounted) await $.ui.open({ id: PANE, title: 'gitlogue', rows: 24, ...(chatOption ? { columns: WIDE_DOCK } : {}) })
+    const t0 = entries[0].at
+    entries.forEach((entry, i) =>
+      $.clock.after(Math.max(1, entry.at - t0 + 1500), () => {
+        if (entry.kind === 'event') enqueue(entry.data as PlayerEvent)
+        else if (entry.op === 'add') chatAdd(entry.data as Parameters<typeof chatAdd>[0])
+        else if (entry.op === 'read') chatRead()
+        else if (entry.op === 'working') chatWorking(entry.data === true)
+        if (i === entries.length - 1) replaying = false
+        $.ui.invalidate('ui.render')
+      }),
+    )
+    return `Replaying ${entries.length} recorded steps from ${file}.`
+    }
     const stored = await $.store.get(RECENT_KEY)
     let recent: string[] = Array.isArray(stored) ? stored.filter((id): id is string => typeof id === 'string') : []
     let storedAt = 0
@@ -255,6 +357,7 @@ export const register: Register = (on, options) => {
     resume = async (id: string) => {
       if (id === session) return
       session = id
+      await openLog(id)
       const kept = (await $.store.get(recordKey(id))) as GitlogueSaved | undefined
       if (kept?.chat?.format === CHAT_FORMAT) chat.restore(kept.chat.lines)
       else chat.load(await conversation(id))
@@ -357,7 +460,7 @@ export const register: Register = (on, options) => {
         const remove = [note.file, `${dir}/${name}`, frames]
         await $.process.run(['mkdir', '-p', frames]).catch(() => undefined)
         const made = await $.process
-          .run(['ffmpeg', '-v', 'error', '-y', '-i', note.file, '-vf', `setpts=PTS/${speed},fps=${fps},scale=960:-2`, `${frames}/f%04d.png`], { timeoutMs: 120_000 })
+          .run(['ffmpeg', '-v', 'error', '-y', '-i', note.file, '-vf', `setpts=PTS/${speed},fps=${fps},scale=1920:-2`, `${frames}/f%04d.png`], { timeoutMs: 120_000 })
           .catch(() => undefined)
         const list = made?.exitCode === 0 ? (await $.fs.list(frames).catch(() => [])).map(entry => entry.name).filter(n => n.endsWith('.png')).sort() : []
         enqueue({
@@ -393,7 +496,8 @@ export const register: Register = (on, options) => {
       })
     await $.command.register({
       name: 'gitlogue',
-      description: "Show or hide the gitlogue pane, which replays Claude's edits as live typing",
+      description: "Show or hide the gitlogue pane, which replays Claude's edits as live typing; `replay [session]` plays a recorded session again from its start",
+      argumentHint: '[replay [session-id]]',
     })
     if (openAtStart && e.isInteractive) void $.ui.open({ id: PANE, title: 'gitlogue', rows: 24, ...(chatOption ? { columns: WIDE_DOCK } : {}) })
     // After a reload the pane may still be up, drawn by the module before this one.
@@ -424,6 +528,26 @@ export const register: Register = (on, options) => {
   })
 
   const chat = new Chat()
+  const chatAdd = chat.add.bind(chat)
+  const chatRead = chat.markRead.bind(chat)
+  const chatWorking = chat.working.bind(chat)
+  let lastWorking: boolean | undefined
+  chat.add = line => {
+    record({ kind: 'chat', op: 'add', data: line })
+    chatAdd(line)
+  }
+  chat.markRead = () => {
+    record({ kind: 'chat', op: 'read' })
+    chatRead()
+  }
+  // While a replay plays, the phone shows the replayed session's work, not this one's.
+  chat.working = isWorking => {
+    if (replaying) return
+    if (isWorking !== lastWorking) record({ kind: 'chat', op: 'working', data: isWorking })
+    lastWorking = isWorking
+    chatWorking(isWorking)
+  }
+
   registerChat(on, { isOn: isChatOn, chat })
 
   // /resume inside a running session switches to another one's replay.
@@ -439,7 +563,13 @@ export const register: Register = (on, options) => {
     return { result: 'The gitlogue mod is running its latest code; its pane and chat view are redrawn.' }
   })
 
-  on('command.run', { command: 'gitlogue' }, async $ => {
+  on('command.run', { command: 'gitlogue' }, async ($, e) => {
+    const words = String((e as { args?: unknown }).args ?? '').trim().split(/\s+/)
+    if (words[0] === 'replay') {
+      const said = await replay(words[1] ?? '')
+      $.ui.toast(said)
+      return {}
+    }
     const isOpen = (await $.ui.panes()).some(pane => pane.id === PANE)
     if (isOpen) await $.ui.close({ id: PANE })
     else await $.ui.open({ id: PANE, title: 'gitlogue', rows: 24, ...(chatOption ? { columns: WIDE_DOCK } : {}) })
