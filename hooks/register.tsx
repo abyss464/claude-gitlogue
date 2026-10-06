@@ -16,6 +16,9 @@ import { Player, type PlayerEvent } from './player'
 import { DEFAULT_THEME, THEMES } from './themes'
 
 const PANE = 'gitlogue'
+// Claude Code's own diff pane, and how long after /diff its open counts as asked.
+const DIFF_PANE = 'diff'
+const DIFF_ASK_MS = 10_000
 const SAVED = { plugin: 'gitlogue', key: 'saved' } as const
 const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit'])
 const FAST_TICK_MS = 33
@@ -589,6 +592,20 @@ export const register: Register = (on, options) => {
     return { result: 'The gitlogue mod is running its latest code; its pane and chat view are redrawn.' }
   })
 
+  // A pane opened later takes the dock from the one shown, and Claude Code's
+  // diff pane opens by itself as Claude edits: while this pane is up, the
+  // diff pane opens only when the person asks for it with /diff.
+  let diffAskedAt = 0
+  on('command.run', { command: 'diff' }, ($, e, next) => {
+    diffAskedAt = Date.now()
+    return next(e)
+  })
+  on('ui.open', { id: DIFF_PANE }, async ($, e, next) => {
+    const isUp = (await $.ui.panes().catch(() => [])).some(pane => pane.id === PANE)
+    if (!isUp || Date.now() - diffAskedAt < DIFF_ASK_MS) return next(e)
+    return { value: { isPlaced: false as const, reason: 'gitlogue holds the dock; /diff opens the diff pane' } }
+  })
+
   on('command.run', { command: 'gitlogue' }, async ($, e) => {
     const args = String((e as { args?: unknown }).args ?? '').trim().split(/\s+/)
     if (args[0] === 'replay') {
@@ -596,8 +613,10 @@ export const register: Register = (on, options) => {
       $.ui.toast(said)
       return {}
     }
-    const isOpen = (await $.ui.panes()).some(pane => pane.id === PANE)
-    if (isOpen) await $.ui.close({ id: PANE })
+    // Shown, it closes; behind another pane's tab, it comes to the front.
+    const pane = (await $.ui.panes()).find(pane => pane.id === PANE)
+    if (pane && !pane.isShown) await $.ui.open({ id: PANE, title: 'gitlogue', focus: true })
+    else if (pane) await $.ui.close({ id: PANE })
     else await $.ui.open({ id: PANE, title: 'gitlogue', rows: 24, ...(chatOption ? { columns: WIDE_DOCK } : {}) })
     return {}
   })
