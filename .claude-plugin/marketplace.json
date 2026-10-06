@@ -1,0 +1,14 @@
+{
+  "name": "claude-gitlogue",
+  "description": "The gitlogue mod for Claude Code: watch Claude work in a live pane.",
+  "owner": {
+    "name": "abyss464"
+  },
+  "plugins": [
+    {
+      "name": "gitlogue",
+      "source": "./",
+      "description": "Watch Claude work: a gitlogue-style pane that replays its edits as live typing, reads code with a highlighter, searches, browses, runs commands and commits, beside a phone-style chat."
+    }
+  ]
+}

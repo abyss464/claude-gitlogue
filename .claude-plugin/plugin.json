@@ -1,7 +1,20 @@
 {
   "name": "gitlogue",
   "version": "0.1.0",
-  "description": "Replays Claude's edits as gitlogue-style live typing in a pane: file tree, editor, turn info and terminal.",
+  "description": "Watch Claude work: a gitlogue-style pane that replays its edits as live typing, reads code with a highlighter, searches, browses, runs commands and commits, beside a phone-style chat.",
+  "author": {
+    "name": "abyss464"
+  },
+  "homepage": "https://github.com/abyss464/claude-gitlogue",
+  "repository": "https://github.com/abyss464/claude-gitlogue",
+  "license": "ISC",
+  "keywords": [
+    "gitlogue",
+    "animation",
+    "pane",
+    "visualization",
+    "chat"
+  ],
   "userConfig": {
     "theme": {
       "type": "string",
@@ -67,6 +80,18 @@
       "options": [
         "on",
         "off"
+      ]
+    },
+    "language": {
+      "type": "string",
+      "title": "Language",
+      "description": "The language of the pane and the phone: auto follows Claude Code's language setting, else the system locale.",
+      "default": "auto",
+      "options": [
+        "auto",
+        "en",
+        "zh",
+        "ja"
       ]
     }
   },

@@ -6,6 +6,8 @@
 
 import type { On } from 'claude-code'
 
+import { cellWidth } from './cells'
+import { words } from './i18n'
 import type { Theme } from './themes'
 import type { GitlogueChatLine } from '../types'
 
@@ -20,22 +22,6 @@ const MASCOT = [' ▐▛███▜▌ ', '▝▜█████▛▘', '  ▘
 const AVATAR_WIDTH = 10
 
 export type ChatLine = GitlogueChatLine
-
-const isWide = (cp: number) =>
-  cp > 0xffff ||
-  (cp >= 0x1100 && cp <= 0x115f) ||
-  (cp >= 0x2e80 && cp <= 0xa4cf) ||
-  (cp >= 0xac00 && cp <= 0xd7a3) ||
-  (cp >= 0xf900 && cp <= 0xfaff) ||
-  (cp >= 0xfe30 && cp <= 0xfe4f) ||
-  (cp >= 0xff00 && cp <= 0xff60) ||
-  (cp >= 0xffe0 && cp <= 0xffe6)
-
-function cellWidth(text: string): number {
-  let width = 0
-  for (const ch of text) width += isWide(ch.codePointAt(0)!) ? 2 : 1
-  return width
-}
 
 // How wide a bubble for `text` is: its longest line, within the room.
 function bubbleWidth(text: string, room: number, isMarkdown: boolean): number {
@@ -193,7 +179,7 @@ export function drawPhone(
       return (
         <Box flexDirection="row" justifyContent="flex-end" alignItems="flex-end" marginTop={1} flexShrink={0}>
           <Box flexDirection="column" alignItems="flex-end" marginRight={1}>
-            {line.isRead && <Text dimColor>已读</Text>}
+            {line.isRead && <Text dimColor>{words.read}</Text>}
             {line.time && <Text dimColor>{line.time}</Text>}
           </Box>
           <Box flexDirection="column" width={bubble}>
@@ -251,7 +237,7 @@ export function drawPhone(
         <Box paddingX={1} backgroundColor={hex(THEIRS)}>
           <Text>···</Text>
         </Box>
-        <Text dimColor> 正在输入…</Text>
+        <Text dimColor> {words.typing}</Text>
       </Box>,
     )
 
@@ -272,7 +258,7 @@ export function drawPhone(
         {chat.floor !== null && (
           <Box position="absolute" bottom={0} left={0} width={width} justifyContent="center">
             <Box backgroundColor={bar} paddingX={1}>
-              <Text dimColor>↓ 往下滚回到最新</Text>
+              <Text dimColor>{words.backToLatest}</Text>
             </Box>
           </Box>
         )}
@@ -294,7 +280,7 @@ export function registerChat(on: On, ctx: { isOn: () => boolean; chat: Chat }) {
   // What the person sends, at once, idle or mid-turn.
   on('prompt.submit', ($, e, next) => {
     if (e.origin.kind === 'composer' || e.origin.kind === 'bridge') {
-      const images = e.attachments?.length ? ` [${e.attachments.length} 张图片]` : ''
+      const images = e.attachments?.length ? ` ${words.images(e.attachments.length)}` : ''
       chat.add({ role: 'me', text: e.text.trim() + images, time: now(), isRead: false })
       $.ui.invalidate('ui.render')
     }

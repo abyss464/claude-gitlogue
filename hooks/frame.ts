@@ -2,6 +2,8 @@
 // on the left (30%), editor over terminal on the right (70%), an Open File
 // dialog over the middle. Cells are packed as Raster cells: [codePoint, fg, bg].
 
+import { cellWidth, isWide, TAIL } from './cells'
+import { words } from './i18n'
 import { Tok } from './highlight'
 import type { FileEntry, Player } from './player'
 import type { Theme } from './themes'
@@ -32,10 +34,16 @@ export function layoutFor(width: number, height: number): Layout {
   }
 }
 
+// Wide characters drawn over the Raster, which holds narrow ones only: each
+// run starts at a cell and covers two cells a character.
+export type WideRun = { x: number; y: number; text: string; fg: number; bg: number }
+
 export class Canvas {
   readonly width: number
   readonly height: number
   readonly cells: Uint32Array
+  // The wide characters by the cell they start at; the Raster has blanks there.
+  readonly wide = new Map<number, string>()
 
   constructor(width: number, height: number) {
     this.width = width
@@ -50,8 +58,19 @@ export class Canvas {
 
   set(x: number, y: number, ch: string, fg: number, bg: number) {
     if (x < 0 || y < 0 || x >= this.width || y >= this.height) return
-    const i = (y * this.width + x) * 3
-    this.cells[i] = ch.charCodeAt(0)
+    const at = y * this.width + x
+    const i = at * 3
+    const code = ch.charCodeAt(0)
+    this.wide.delete(at)
+    if (code >= 0xdc00 && code <= 0xdfff) {
+      // The second half of a character past the BMP completes the first.
+      const head = this.wide.get(at - 1)
+      if (head?.length === 1 && x > 0) this.wide.set(at - 1, head + ch[0])
+      this.cells[i] = 0x20
+    } else if ((code >= 0xd800 && code <= 0xdbff) || isWide(code)) {
+      this.wide.set(at, ch.length > 1 && code >= 0xd800 ? ch.slice(0, 2) : ch[0])
+      this.cells[i] = 0x20
+    } else this.cells[i] = ch === TAIL ? 0x20 : code
     this.cells[i + 1] = fg
     this.cells[i + 2] = bg
   }
@@ -65,10 +84,45 @@ export class Canvas {
     for (let col = Math.max(0, x); col < Math.min(this.width, x + w); col++) this.cells[(y * this.width + col) * 3 + 2] = bg
   }
 
-  // Writes text from (x, y), cut at `maxX`; returns where it stopped.
+  // Writes text from (x, y), cut at `maxX`; returns where it stopped. A wide
+  // character takes two cells, and one that would be cut leaves a blank.
   text(x: number, y: number, s: string, fg: number, bg: number, maxX = this.width): number {
-    for (let i = 0; i < s.length && x < maxX; i++) this.set(x++, y, s[i], fg, bg)
+    for (let i = 0; i < s.length && x < maxX; i++) {
+      const code = s.charCodeAt(i)
+      const isPair = code >= 0xd800 && code <= 0xdbff && i + 1 < s.length
+      if (!isPair && !isWide(code)) {
+        this.set(x++, y, s[i], fg, bg)
+        continue
+      }
+      if (x + 1 >= maxX) {
+        this.set(x++, y, ' ', fg, bg)
+        break
+      }
+      this.set(x++, y, s[i], fg, bg)
+      this.set(x++, y, isPair ? s[++i] : TAIL, fg, bg)
+      if (!isPair && s[i + 1] === TAIL) i++
+    }
     return x
+  }
+
+  // The wide characters within one rectangle, from its corner, as runs of
+  // one color each.
+  wideRuns(x: number, y: number, w: number, h: number): WideRun[] {
+    const runs: WideRun[] = []
+    const heads = [...this.wide.keys()].sort((a, b) => a - b)
+    for (const at of heads) {
+      const col = at % this.width
+      const row = Math.floor(at / this.width)
+      const text = this.wide.get(at)!
+      if (row < y || row >= y + h || col < x || col + 1 >= x + w) continue
+      if (text.length === 1 && text.charCodeAt(0) >= 0xd800 && text.charCodeAt(0) <= 0xdbff) continue
+      const fg = this.cells[at * 3 + 1]
+      const bg = this.cells[at * 3 + 2]
+      const last = runs[runs.length - 1]
+      if (last && last.y === row - y && last.x + 2 * [...last.text].length === col - x && last.fg === fg && last.bg === bg) last.text += text
+      else runs.push({ x: col - x, y: row - y, text, fg, bg })
+    }
+    return runs
   }
 
   // The cells of one rectangle, base64 as a Raster takes them.
@@ -196,8 +250,8 @@ function paintEditor(canvas: Canvas, player: Player, theme: Theme, box: Box, cur
   if (area.w <= 0 || area.h <= 0) return
 
   if (!player.hasFile) {
-    const message = player.turn ? 'Waiting for Claude to edit...' : 'Waiting for Claude...'
-    const x = area.x + Math.max(0, Math.floor((area.w - message.length) / 2))
+    const message = player.turn ? words.waitingEdit : words.waiting
+    const x = area.x + Math.max(0, Math.floor((area.w - cellWidth(message)) / 2))
     canvas.text(x, area.y + Math.floor(area.h / 2), message, theme.statusNoCommit, bg, area.x + area.w)
     return
   }
@@ -384,7 +438,7 @@ function paintCast(canvas: Canvas, player: Player, theme: Theme, box: Box) {
   const cast = player.cast
   if (!cast || area.w <= 0 || area.h <= 0) return
   let x = canvas.text(area.x, area.y, '● ', theme.fileTreeDeleted, bg)
-  x = canvas.text(x, area.y, `screen ${cast.screen}`, theme.fileTreeCurrentFileFg, bg, area.x + area.w)
+  x = canvas.text(x, area.y, words.screen(cast.screen), theme.fileTreeCurrentFileFg, bg, area.x + area.w)
   canvas.text(x, area.y, `  ${cast.width}×${cast.height}  ×${cast.speed}`, theme.editorLineNumber, bg, area.x + area.w)
   canvas.text(area.x, area.y + 1, '─'.repeat(area.w), theme.separator, bg)
 }
@@ -440,7 +494,7 @@ function paintBrowser(canvas: Canvas, player: Player, theme: Theme, box: Box, cu
     const y = top + Math.max(0, Math.floor(rows / 2) - 4)
     mark(area.x + Math.floor((area.w - 11) / 2), y, true)
     searchBox(canvas, theme, left, y + 2, width, b.query, typing && b.focus === 'box', bg)
-    const buttons = '[ Google Search ]   [ I’m Feeling Lucky ]'
+    const buttons = words.googleButtons
     canvas.text(area.x + Math.max(0, Math.floor((area.w - buttons.length) / 2)), y + 6, buttons, theme.editorLineNumber, bg, maxX)
     return
   }
@@ -555,7 +609,7 @@ function paintSearch(canvas: Canvas, player: Player, theme: Theme, area: Box) {
   const bg = theme.backgroundLeft
   const search = player.search!
   const maxX = area.x + area.w
-  canvas.text(area.x, area.y, 'SEARCH', theme.editorLineNumber, bg)
+  canvas.text(area.x, area.y, words.searchTitle, theme.editorLineNumber, bg)
   const box = theme.editorCursorLineBg
   canvas.background(area.x, area.y + 1, area.w, box)
   const room = area.w - 2
@@ -565,7 +619,7 @@ function paintSearch(canvas: Canvas, player: Player, theme: Theme, area: Box) {
   const files = search.hits.slice(0, search.shown)
   const matches = files.reduce((n, hit) => n + Math.max(1, hit.matches.length), 0)
   if (search.shown > 0)
-    canvas.text(area.x, area.y + 2, `${search.total || matches} results in ${search.hits.length} files`, theme.editorLineNumber, bg, maxX)
+    canvas.text(area.x, area.y + 2, words.searchResults(search.total || matches, search.hits.length), theme.editorLineNumber, bg, maxX)
   let pattern: RegExp | undefined
   try {
     pattern = new RegExp(search.query, 'i')
@@ -775,7 +829,7 @@ function paintTerminal(canvas: Canvas, player: Player, theme: Theme, box: Box, c
         break
       case 'trash':
         put('✗ ', theme.fileTreeDeleted)
-        put('moved to trash  ', theme.terminalOutput)
+        put(words.movedToTrash + '  ', theme.terminalOutput)
         put(fit(line.text, Math.max(0, maxX - x)), theme.fileTreeDeleted)
         break
       case 'output':

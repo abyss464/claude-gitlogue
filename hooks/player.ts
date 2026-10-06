@@ -19,6 +19,8 @@ import type {
 } from '../types'
 import { countChanges, diffLines, type Hunk } from './diff'
 import { chainTo, Explorer, nameOf, parentOf, type DirEntry } from './explorer'
+import { cellText } from './cells'
+import { words } from './i18n'
 import { Highlighter } from './highlight'
 
 const CURSOR_MOVE_PAUSE = 0.5
@@ -74,7 +76,6 @@ const LOCK_FILES = new Set([
   'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'bun.lockb', 'Cargo.lock', 'poetry.lock', 'uv.lock',
   'Pipfile.lock', 'Gemfile.lock', 'composer.lock', 'go.sum', 'flake.lock', 'mix.lock', 'pubspec.lock',
 ])
-const TAB_WIDTH = 4
 
 export type TurnInfo = GitlogueTurn
 export type FileEntry = GitlogueFileEntry
@@ -125,65 +126,6 @@ type StepBody =
   | { k: 'resetTurn'; turn: TurnInfo }
 
 type Step = StepBody & { dur: number }
-
-// Wide characters take two terminal cells, which a Raster cell cannot hold:
-// they become two narrow dots, so columns still line up.
-function isWide(cp: number): boolean {
-  return (
-    cp > 0xffff ||
-    (cp >= 0x1100 && cp <= 0x115f) ||
-    (cp >= 0x2e80 && cp <= 0xa4cf && cp !== 0x303f) ||
-    (cp >= 0xac00 && cp <= 0xd7a3) ||
-    (cp >= 0xf900 && cp <= 0xfaff) ||
-    (cp >= 0xfe30 && cp <= 0xfe4f) ||
-    (cp >= 0xff00 && cp <= 0xff60) ||
-    (cp >= 0xffe0 && cp <= 0xffe6) ||
-    (cp >= 0x231a && cp <= 0x231b) ||
-    (cp >= 0x23e9 && cp <= 0x23f3) ||
-    (cp >= 0x25fd && cp <= 0x25fe) ||
-    (cp >= 0x2614 && cp <= 0x2615) ||
-    (cp >= 0x2648 && cp <= 0x2653) ||
-    cp === 0x267f ||
-    cp === 0x2693 ||
-    cp === 0x26a1 ||
-    (cp >= 0x26aa && cp <= 0x26ab) ||
-    (cp >= 0x26bd && cp <= 0x26be) ||
-    (cp >= 0x26c4 && cp <= 0x26c5) ||
-    cp === 0x26ce ||
-    cp === 0x26d4 ||
-    cp === 0x26ea ||
-    (cp >= 0x26f2 && cp <= 0x26fd) ||
-    cp === 0x2705 ||
-    (cp >= 0x270a && cp <= 0x270b) ||
-    cp === 0x2728 ||
-    cp === 0x274c ||
-    cp === 0x274e ||
-    (cp >= 0x2753 && cp <= 0x2757) ||
-    (cp >= 0x2795 && cp <= 0x2797) ||
-    cp === 0x27b0 ||
-    cp === 0x27bf ||
-    (cp >= 0x2b1b && cp <= 0x2b1c) ||
-    cp === 0x2b50 ||
-    cp === 0x2b55
-  )
-}
-
-const isInvisible = (cp: number) =>
-  (cp >= 0x0300 && cp <= 0x036f) || (cp >= 0x200b && cp <= 0x200f) || (cp >= 0xfe00 && cp <= 0xfe0f) || cp === 0xfeff
-
-// One line as a run of single-cell characters.
-export function cellText(line: string): string {
-  let out = ''
-  for (const ch of line) {
-    const cp = ch.codePointAt(0)!
-    if (ch === '\t') out += ' '.repeat(TAB_WIDTH - (out.length % TAB_WIDTH))
-    else if (cp < 0x20 || (cp >= 0x7f && cp < 0xa0)) out += ' '
-    else if (isInvisible(cp)) continue
-    else if (isWide(cp)) out += '··'
-    else out += ch
-  }
-  return out
-}
 
 const splitLines = (text: string) => (text === '' ? [] : text.replace(/\r?\n$/, '').split(/\r?\n/).map(cellText))
 const indentOf = (line: string | undefined) => (line ?? '').length - (line ?? '').trimStart().length
@@ -422,7 +364,7 @@ export class Player {
         this.push({ k: 'termResult', right: `${formatDuration(event.durationMs, true)} ${status}`, ok: !event.failed })
         event.lines.forEach((text, i) => this.push({ k: 'termLine', line: { kind: 'output', text, first: i === 0 } }, this.speedMs / 2))
         if (event.total > event.lines.length)
-          this.push({ k: 'termLine', line: { kind: 'more', text: `… +${event.total - event.lines.length} lines` } })
+          this.push({ k: 'termLine', line: { kind: 'more', text: words.moreLines(event.total - event.lines.length) } })
         this.pause(PUSH_OUTPUT_PAUSE)
         break
       }
@@ -538,7 +480,7 @@ export class Player {
       this.push({ k: 'count', entry: { path: event.path, status: event.created ? '+' : '~', added, deleted, file: event.file } })
       this.push({
         k: 'termLine',
-        line: { kind: 'edit', text: `${cellText(event.path)} · ${skipped}, not replayed`, right: `+${added} −${deleted}`, ok: true },
+        line: { kind: 'edit', text: `${cellText(event.path)} · ${words.notReplayed(skipped)}`, right: `+${added} −${deleted}`, ok: true },
       })
       this.pause(GIT_ADD_CMD_PAUSE)
       return
@@ -677,7 +619,7 @@ export class Player {
       page: 'results',
       results,
       shown: 0,
-      stats: `${results.length} results (${seconds} seconds)`,
+      stats: words.webStats(results.length, seconds),
       loading: 0,
     })
     this.scriptLoad()
@@ -832,7 +774,7 @@ export class Player {
         fraction = i === DOWNLOAD_STEPS ? 1 : Math.min(0.97, fraction + (Math.random() * 2) / DOWNLOAD_STEPS)
         this.push({ k: 'progress', fraction, right: `${Math.round(fraction * 100)}%` }, (span / DOWNLOAD_STEPS) * (0.4 + Math.random() * 1.2))
       }
-      this.push({ k: 'progress', fraction: 1, right: `pushed · ${formatDuration(event.durationMs, true)}` })
+      this.push({ k: 'progress', fraction: 1, right: words.pushed(formatDuration(event.durationMs, true)) })
       this.pause(GIT_ADD_CMD_PAUSE)
     }
   }
@@ -874,7 +816,7 @@ export class Player {
     const speed = Math.round(event.speed * 10) / 10
     this.push({
       k: 'termLine',
-      line: { kind: 'cast', text: `screen ${event.screen} · ${event.seconds.toFixed(1)}s`, right: `×${speed}` },
+      line: { kind: 'cast', text: `${words.screen(event.screen)} · ${event.seconds.toFixed(1)}s`, right: `×${speed}` },
     })
     this.push({ k: 'castStart', cast: { screen: event.screen, width: event.width, height: event.height, speed, seconds: event.seconds } }, 0)
     this.planScreen = 'cast'
@@ -1193,7 +1135,7 @@ export class Player {
         break
       }
       case 'dialogOpen':
-        this.dialog = { title: 'Open File...', text: '' }
+        this.dialog = { title: words.openFile, text: '' }
         break
       case 'dialogChar':
         if (this.dialog) this.dialog.text += step.ch
@@ -1224,10 +1166,10 @@ export class Player {
       }
       case 'termDone': {
         this.active = 'terminal'
-        const word = this.wordFor(step.durationMs) ?? 'Done'
+        const word = this.wordFor(step.durationMs) ?? words.done
         this.addLine(
           step.aborted
-            ? { kind: 'fail', text: 'Interrupted' }
+            ? { kind: 'fail', text: words.interrupted }
             : { kind: 'done', text: `${word} for ${formatDuration(step.durationMs)}` },
         )
         this.addLine({ kind: 'prompt', text: '' })
@@ -1250,15 +1192,15 @@ const isLog = (path: string) => /\.(log|out|err|ansi|trace|pid|jsonl)(\.\d+)?$/i
 
 // Why a change is not typed out, or undefined when it is.
 function untypeable(path: string, hunks: Hunk[]): string | undefined {
-  if (LOCK_FILES.has(path.slice(path.lastIndexOf('/') + 1))) return 'lock file'
-  if (isLog(path)) return 'log'
+  if (LOCK_FILES.has(path.slice(path.lastIndexOf('/') + 1))) return words.lockFile
+  if (isLog(path)) return words.logFile
   let typed = 0
   for (const hunk of hunks)
     for (const line of hunk.lines) {
-      if (line.text.length > MAX_TYPED_LINE) return 'generated'
+      if (line.text.length > MAX_TYPED_LINE) return words.generated
       if (line.kind === 'add') typed += line.text.length
     }
-  return typed > MAX_TYPED_CHARS ? 'too large' : undefined
+  return typed > MAX_TYPED_CHARS ? words.tooLarge : undefined
 }
 
 // Whether a changed line is mostly the line it replaces: what both start and

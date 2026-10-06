@@ -10,7 +10,8 @@ import type { GitlogueLink, GitloguePlace, GitlogueSaved, GitlogueCapture } from
 import { candidatePaths, commitMessageOf, downloadTargets, hitsOf, reverseApply, searchOf, type EngineHunk } from './bashfiles'
 import { chainTo, parentOf, type DirEntry } from './explorer'
 import { Chat, drawPhone, registerChat } from './chat'
-import { imageBox, layoutFor, paint, type Layout } from './frame'
+import { languageOf, speak, words } from './i18n'
+import { DEFAULT_COLOR, imageBox, layoutFor, paint, type Layout, type WideRun } from './frame'
 import { Player, type PlayerEvent } from './player'
 import { DEFAULT_THEME, THEMES } from './themes'
 
@@ -95,6 +96,7 @@ export const register: Register = (on, options) => {
   const maxLagMs = (Math.max(1, Number(options.maxLag) || 20) * 1000) / rate
   const openAtStart = options.open !== 'command'
   const chatOption = options.chat !== 'off'
+  const languageOption = String(options.language ?? 'auto')
 
   const player = new Player(speedMs, maxLagMs)
   let cwd = ''
@@ -125,7 +127,7 @@ export const register: Register = (on, options) => {
   let capturesChanged = false
   let shownChat = -1
   let lastTick = Date.now()
-  let sent = { tree: '', main: '' }
+  let sent = { tree: '', main: '', wide: '' }
   let isBlitting = false
   let timer: { cancel: () => void } | undefined
   let timerMs = 0
@@ -136,10 +138,16 @@ export const register: Register = (on, options) => {
   const frames = (layout: Layout) => {
     const canvas = paint(player, theme, layout, Math.floor(Date.now() / BLINK_MS) % 2 === 0)
     const treeRows = layout.bottomRows > 0 ? layout.topRows + 1 : layout.height
+    const treeWide = layout.leftWidth > 0 ? canvas.wideRuns(0, 0, layout.leftWidth, treeRows) : []
+    const mainWide = canvas.wideRuns(layout.leftWidth, 0, layout.rightWidth, layout.height)
     return {
       treeRows,
       tree: layout.leftWidth > 0 ? canvas.encode(0, 0, layout.leftWidth, treeRows) : '',
       main: canvas.encode(layout.leftWidth, 0, layout.rightWidth, layout.height),
+      treeWide,
+      mainWide,
+      // Wide characters are drawn as text in the tree: a change to them redraws it.
+      wide: JSON.stringify([treeWide, mainWide]),
     }
   }
 
@@ -162,7 +170,7 @@ export const register: Register = (on, options) => {
   // Set up where the session's engine is in reach, as `schedule` is.
   let saveLog = () => {}
   let runCopy = (_argv: string[]) => {}
-  let replay = async (_id: string): Promise<string> => 'gitlogue has not started yet.'
+  let replay = async (_id: string): Promise<string> => words.notStarted
   const record = (entry: Omit<ReplayEntry, 'at'>) => {
     if (replaying || !replayFile) return
     let data = entry.data as PlayerEvent
@@ -190,6 +198,18 @@ export const register: Register = (on, options) => {
 
   on('session.start', async ($, e, next) => {
     cwd = e.cwd
+    // The pane's language: the option, else Claude Code's, else the locale's.
+    const setting = (await $.settings.read().catch(() => ({}) as Record<string, unknown>)).language
+    const locale =
+      (await $.env.get('LC_ALL').catch(() => undefined)) ||
+      (await $.env.get('LC_MESSAGES').catch(() => undefined)) ||
+      (await $.env.get('LANG').catch(() => undefined))
+    speak(
+      languageOf(languageOption === 'auto' ? undefined : languageOption) ??
+        languageOf(typeof setting === 'string' ? setting : undefined) ??
+        languageOf(locale ?? undefined) ??
+        'en',
+    )
     replayDir = `${(await $.env.get('HOME')) ?? '/tmp'}/.cache/gitlogue/replays`
     await $.process.run(['mkdir', '-p', `${replayDir}/assets`]).catch(() => undefined)
     runtimeDir = (await $.env.get('XDG_RUNTIME_DIR')) ?? ''
@@ -232,11 +252,11 @@ export const register: Register = (on, options) => {
       const logs = (await $.fs.list(replayDir).catch(() => []))
         .filter(entry => entry.name.endsWith('.jsonl') && `${replayDir}/${entry.name}` !== replayFile)
         .sort((a, b) => b.mtimeMs - a.mtimeMs)
-      if (!logs.length) return 'No recorded session to replay yet.'
+      if (!logs.length) return words.nothingRecorded
       file = `${replayDir}/${logs[0].name}`
     }
     const text = await $.fs.read(file).catch(() => undefined)
-    if (typeof text !== 'string') return `No replay log at ${file}.`
+    if (typeof text !== 'string') return words.noReplayLog(file)
     const entries = text
       .split('\n')
       .filter(Boolean)
@@ -264,7 +284,7 @@ export const register: Register = (on, options) => {
         $.ui.invalidate('ui.render')
       }),
     )
-    return `Replaying ${entries.length} recorded steps from ${file}.`
+    return words.replaying(entries.length, file)
     }
     const stored = await $.store.get(RECENT_KEY)
     let recent: string[] = Array.isArray(stored) ? stored.filter((id): id is string => typeof id === 'string') : []
@@ -405,12 +425,18 @@ export const register: Register = (on, options) => {
       } else if (!isBlitting) {
         const layout = mounted
         const frame = frames(layout)
+        if (frame.wide !== sent.wide) {
+          sent = { ...sent, wide: frame.wide }
+          $.ui.invalidate('ui.render')
+          schedule()
+          return
+        }
         const blits: Promise<unknown>[] = []
         if (frame.main !== sent.main)
           blits.push($.ui.blit({ requestId: PANE, key: 'main', cells: frame.main, columns: layout.rightWidth, rows: layout.height }))
         if (frame.tree && frame.tree !== sent.tree)
           blits.push($.ui.blit({ requestId: PANE, key: 'tree', cells: frame.tree, columns: layout.leftWidth, rows: frame.treeRows }))
-        sent = { tree: frame.tree, main: frame.main }
+        sent = { tree: frame.tree, main: frame.main, wide: frame.wide }
         if (blits.length > 0) {
           isBlitting = true
           void Promise.allSettled(blits).then(() => (isBlitting = false))
@@ -496,7 +522,7 @@ export const register: Register = (on, options) => {
       })
     await $.command.register({
       name: 'gitlogue',
-      description: "Show or hide the gitlogue pane, which replays Claude's edits as live typing; `replay [session]` plays a recorded session again from its start",
+      description: words.commandDescription,
       argumentHint: '[replay [session-id]]',
     })
     if (openAtStart && e.isInteractive) void $.ui.open({ id: PANE, title: 'gitlogue', rows: 24, ...(chatOption ? { columns: WIDE_DOCK } : {}) })
@@ -507,11 +533,11 @@ export const register: Register = (on, options) => {
 
   // The words Claude Code closes each turn with (`Cogitated for 1m 57s`), by
   // the turn's length, so the terminal ends the turn in the same words.
-  const words = new Map<number, string>()
+  const closingWords = new Map<number, string>()
   player.wordFor = durationMs => {
     let best: string | undefined
     let gap = 2000
-    for (const [ms, word] of words) {
+    for (const [ms, word] of closingWords) {
       if (Math.abs(ms - durationMs) < gap) {
         gap = Math.abs(ms - durationMs)
         best = word
@@ -520,8 +546,8 @@ export const register: Register = (on, options) => {
     return best
   }
   on('ui.render', { component: 'TurnDuration' }, ($, e, next) => {
-    words.set(e.props.durationMs, e.props.word)
-    if (words.size > 50) words.delete(words.keys().next().value as number)
+    closingWords.set(e.props.durationMs, e.props.word)
+    if (closingWords.size > 50) closingWords.delete(closingWords.keys().next().value as number)
     if (!isChatOn() || e.surface !== 'terminal') return next(e)
     const { Box } = $.ui.resolve(e)
     return <Box display="none" />
@@ -564,9 +590,9 @@ export const register: Register = (on, options) => {
   })
 
   on('command.run', { command: 'gitlogue' }, async ($, e) => {
-    const words = String((e as { args?: unknown }).args ?? '').trim().split(/\s+/)
-    if (words[0] === 'replay') {
-      const said = await replay(words[1] ?? '')
+    const args = String((e as { args?: unknown }).args ?? '').trim().split(/\s+/)
+    if (args[0] === 'replay') {
+      const said = await replay(args[1] ?? '')
       $.ui.toast(said)
       return {}
     }
@@ -877,14 +903,14 @@ export const register: Register = (on, options) => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, ($, e) => {
     const { Box, Text } = $.ui.resolve(e)
-    if (e.surface !== 'terminal') return <Text dimColor>gitlogue draws in the terminal.</Text>
+    if (e.surface !== 'terminal') return <Text dimColor>{words.terminalOnly}</Text>
     const { Raster, Image } = $.ui.resolve(e)
 
     const width = Math.min(512, e.props.bodyColumns)
     const height = Math.min(256, e.props.scroll.bodyRows)
     if (width < 20 || height < 4) {
       mounted = undefined
-      return <Text dimColor>gitlogue needs more room.</Text>
+      return <Text dimColor>{words.needsRoom}</Text>
     }
     // The phone takes the pane's left, the replay the rest.
     const phoneWidth = chatOption ? Math.min(64, Math.max(40, Math.floor(width * 0.34))) : 0
@@ -894,7 +920,7 @@ export const register: Register = (on, options) => {
     shownTurn = player.turnVersion
     shownScene = player.sceneVersion
     const frame = frames(layout)
-    sent = { tree: frame.tree, main: frame.main }
+    sent = { tree: frame.tree, main: frame.main, wide: frame.wide }
     schedule()
 
     const turn = player.turn
@@ -916,14 +942,14 @@ export const register: Register = (on, options) => {
     // where the commit message would.
     const touched = turn ? [...player.files.values()].filter(entry => entry.turn === turn.id) : []
     const summary = touched.length === 0
-      ? 'no files changed yet'
-      : `${touched.length} file${touched.length === 1 ? '' : 's'}  +${touched.reduce((n, f) => n + f.added, 0)} -${touched.reduce((n, f) => n + f.deleted, 0)}`
+      ? words.noChanges
+      : `${words.files(touched.length)}  +${touched.reduce((n, f) => n + f.added, 0)} -${touched.reduce((n, f) => n + f.deleted, 0)}`
     const info = turn
       ? [
-          label('turn: ', turn.id, theme.statusHash),
-          label('author: ', 'Claude', theme.statusAuthor),
-          label('date: ', turn.date, theme.statusDate),
-          ...(isChatOn() ? [label('changes: ', summary, theme.fileTreeModified)] : []),
+          label(words.turn, turn.id, theme.statusHash),
+          label(words.author, 'Claude', theme.statusAuthor),
+          label(words.date, turn.date, theme.statusDate),
+          ...(isChatOn() ? [label(words.changes, summary, theme.fileTreeModified)] : []),
           ...(isChatOn() ? '' : turn.prompt)
             .split('\n')
             .filter(line => line.trim() !== '')
@@ -937,9 +963,19 @@ export const register: Register = (on, options) => {
         ]
       : [
           <Text color={hex(theme.statusNoCommit)} backgroundColor={left}>
-            No turn yet
+            {words.noTurn}
           </Text>,
         ]
+
+    // A run of wide characters, over the blanks the Raster keeps for it.
+    const color = (value: number) => (value === DEFAULT_COLOR ? undefined : hex(value))
+    const wide = (run: WideRun) => (
+      <Box position="absolute" top={run.y} left={run.x}>
+        <Text color={color(run.fg)} backgroundColor={color(run.bg)} wrap="truncate">
+          {run.text}
+        </Text>
+      </Box>
+    )
 
     const { Markdown } = $.ui.resolve(e)
     return (
@@ -948,7 +984,10 @@ export const register: Register = (on, options) => {
         {phoneWidth > 0 && <Box width={1} />}
         {layout.leftWidth > 0 && (
           <Box flexDirection="column" width={layout.leftWidth} height={height}>
-            <Raster key="tree" columns={layout.leftWidth} rows={frame.treeRows} cells={frame.tree} />
+            <Box width={layout.leftWidth} height={frame.treeRows} flexShrink={0}>
+              <Raster key="tree" columns={layout.leftWidth} rows={frame.treeRows} cells={frame.tree} />
+              {frame.treeWide.map(wide)}
+            </Box>
             {layout.bottomRows > 0 && (
               <Box
                 flexDirection="column"
@@ -966,6 +1005,7 @@ export const register: Register = (on, options) => {
         )}
         <Box width={layout.rightWidth} height={height}>
           <Raster key="main" columns={layout.rightWidth} rows={height} cells={frame.main} />
+          {frame.mainWide.map(wide)}
           {castBox && player.castFrame && (
             <Box position="absolute" top={castBox.top} left={castBox.left}>
               <Image
